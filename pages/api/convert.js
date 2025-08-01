@@ -1,64 +1,79 @@
-const formidable = require('formidable');
-const fs = require('fs');
-const xpath = require('xpath');
-const { DOMParser, XMLSerializer } = require('@xmldom/xmldom');
-
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
+import { DOMParser, XMLSerializer } from 'xmldom';
+import xpath from 'xpath';
 
 export default async function handler(req, res) {
-  const form = new formidable.IncomingForm();
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Only POST allowed' });
+  }
 
-  form.parse(req, async (err, fields, files) => {
-    if (err) {
-      res.status(500).json({ error: 'Fehler beim Parsen des Formulars' });
-      return;
+  const { xmlString } = req.body;
+
+  if (!xmlString) {
+    return res.status(400).json({ error: 'Missing XML input' });
+  }
+
+  try {
+    const doc = new DOMParser().parseFromString(xmlString, 'text/xml');
+
+    // Root Element Namespace-Update
+    doc.documentElement.setAttribute('xmlns', 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.08');
+
+    // Anpassung des Namespace-Präfixes (optional, falls nötig)
+    const select = xpath.useNamespaces({ ns: 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.04' });
+
+    // GrpHdr prüfen/umstrukturieren
+    const grpHdr = select('//ns:GrpHdr', doc)[0];
+    if (!grpHdr) throw new Error('GrpHdr not found');
+
+    // Statement-Elemente durchlaufen
+    const statements = select('//ns:Stmt', doc);
+    for (const stmt of statements) {
+      const entries = select('.//ns:Ntry', stmt);
+      for (const entry of entries) {
+        const txDtls = select('.//ns:TxDtls', entry);
+        for (const tx of txDtls) {
+          // <Amt Ccy="CHF"> statt verschachtelt
+          const amt = select('./ns:Amt', tx)[0];
+          if (amt && amt.firstChild) {
+            const currency = amt.getAttribute('Ccy');
+            const amount = amt.textContent;
+            const newAmt = doc.createElement('Amt');
+            newAmt.setAttribute('Ccy', currency || 'CHF');
+            newAmt.textContent = amount;
+            tx.replaceChild(newAmt, amt);
+          }
+
+          // <RltdPties>
+          let rltdPties = select('./ns:RltdPties', tx)[0];
+          if (rltdPties) {
+            tx.removeChild(rltdPties);
+          }
+
+          rltdPties = doc.createElement('RltdPties');
+
+          const cdtr = doc.createElement('Cdtr');
+          const cdtrNm = doc.createElement('Nm');
+          cdtrNm.textContent = 'Unbekannt';
+          cdtr.appendChild(cdtrNm);
+
+          const cdtrAcct = doc.createElement('CdtrAcct');
+          const id = doc.createElement('Id');
+          const iban = doc.createElement('IBAN');
+          iban.textContent = 'CH0000000000000000000';
+          id.appendChild(iban);
+          cdtrAcct.appendChild(id);
+
+          rltdPties.appendChild(cdtr);
+          rltdPties.appendChild(cdtrAcct);
+          tx.appendChild(rltdPties);
+        }
+      }
     }
 
-    const file = files.file[0];
-    const xmlData = fs.readFileSync(file.filepath, 'utf8');
-
-    const doc = new DOMParser().parseFromString(xmlData, 'application/xml');
-    const select = xpath.useNamespaces({
-      ns: 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.04',
-    });
-
-    const reltdPtiesNodes = select('//ns:RltdPties', doc);
-    reltdPtiesNodes.forEach(node => {
-      // Entferne bisherige Inhalte
-      while (node.firstChild) node.removeChild(node.firstChild);
-
-      // Erstelle neuen Inhalt für <RltdPties>
-      const cdtr = doc.createElement('Cdtr');
-      const pty = doc.createElement('Pty');
-      const nm = doc.createElement('Nm');
-      nm.textContent = 'HOSTPOINT AG';
-
-      const pstlAdr = doc.createElement('PstlAdr');
-      const adrLine = doc.createElement('AdrLine');
-      adrLine.textContent = 'RAPPERSWIL-SG  CHE';
-
-      pstlAdr.appendChild(adrLine);
-      pty.appendChild(nm);
-      pty.appendChild(pstlAdr);
-      cdtr.appendChild(pty);
-      node.appendChild(cdtr);
-
-      const cdtrAcct = doc.createElement('CdtrAcct');
-      const id = doc.createElement('Id');
-      const iban = doc.createElement('IBAN');
-      iban.textContent = 'CH7483019KOMUNIQUE000';
-      id.appendChild(iban);
-      cdtrAcct.appendChild(id);
-      node.appendChild(cdtrAcct);
-    });
-
-    const outputXml = new XMLSerializer().serializeToString(doc);
-
-    res.setHeader('Content-Type', 'application/xml');
-    res.status(200).send(outputXml);
-  });
+    const output = new XMLSerializer().serializeToString(doc);
+    res.status(200).json({ convertedXml: output });
+  } catch (error) {
+    console.error('Conversion error:', error);
+    res.status(500).json({ error: 'Failed to convert XML.' });
+  }
 }
