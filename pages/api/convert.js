@@ -19,14 +19,14 @@ const TX_ORDER   = ['Refs','Amt','CdtDbtInd','AmtDtls','BkTxCd','RltdPties','Rlt
 
 function ensureArray(v) {
   if (Array.isArray(v)) return v
-  if (v !== undefined && v !== null) return [v]
+  if (v != null) return [v]
   return []
 }
 
 function reorderObject(obj, order, multi = []) {
   const out = {}
-  order.forEach(key => { if (obj[key] !== undefined) out[key] = obj[key] })
-  multi.forEach(key => { if (obj[key] !== undefined) out[key] = obj[key] })
+  order.forEach(k => { if (obj[k] !== undefined) out[k] = obj[k] })
+  multi.forEach(k => { if (obj[k] !== undefined) out[k] = obj[k] })
   Object.keys(obj)
     .filter(k => !order.includes(k) && !multi.includes(k))
     .forEach(k => { out[k] = obj[k] })
@@ -35,13 +35,14 @@ function reorderObject(obj, order, multi = []) {
 
 export default async function handler(req, res) {
   try {
-    // 1) Multipart-Formular parsen
+    // 1) Multipart-Form auslesen
     const form = new formidable.IncomingForm()
     const { fields, files } = await new Promise((resolve, reject) => {
       form.parse(req, (err, fields, files) =>
         err ? reject(err) : resolve({ fields, files })
       )
     })
+
     const file = files.file
     if (!file) {
       res.status(400).send('No file uploaded')
@@ -53,7 +54,7 @@ export default async function handler(req, res) {
       return
     }
 
-    // 2) XML lesen & in JSON parsen
+    // 2) XML lesen und parsen
     const xml = fs.readFileSync(path, 'utf8')
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
     const docJson = parser.parse(xml)
@@ -65,12 +66,11 @@ export default async function handler(req, res) {
     const stmtIn  = docJson.Document.BkToCstmrStmt.Stmt
     const newStmt = reorderObject(stmtIn, STMT_ORDER, STMT_MULTI)
 
-    // 5) Jede Buchung transformieren
+    // 5) Jede Buchung (<Ntry>) aufbauen
     const oldEntries = ensureArray(stmtIn.Ntry)
     newStmt.Ntry = oldEntries.map(oldN => {
       const n = {}
-
-      // 5a) <Ntry>-Felder in korrekter Reihenfolge
+      // 5a) Ntry-Felder
       NTRY_ORDER.forEach(tag => {
         if (tag === 'NtryDtls') {
           if (oldN.NtryDtls) n.NtryDtls = oldN.NtryDtls
@@ -80,26 +80,22 @@ export default async function handler(req, res) {
           n[tag] = oldN[tag]
         }
       })
-
-      // 5b) <TxDtls> transformieren & Fallbacks
+      // 5b) TxDtls transformieren
       if (n.NtryDtls?.TxDtls) {
         const txIn  = n.NtryDtls.TxDtls
         const newTx = reorderObject(txIn, TX_ORDER)
 
-        // fallback <AmtDtls>
         if (!newTx.AmtDtls && txIn.Amt) {
           newTx.AmtDtls = {
             InstdAmt: {
               '#text': txIn.Amt['#text'],
-              'Ccy':   txIn.Amt.Ccy
+              Ccy:      txIn.Amt.Ccy
             }
           }
         }
-        // fallback <RmtInf>
         if (!newTx.RmtInf) {
           newTx.RmtInf = { Ustrd: n.AddtlNtryInf }
         }
-        // Gegenpartei & Agenten
         if (!newTx.RltdPties && oldN.RltdPties) newTx.RltdPties = oldN.RltdPties
         if (!newTx.RltdAgts  && oldN.RltdAgts ) newTx.RltdAgts  = oldN.RltdAgts
         if (!newTx.BkTxCd    && oldN.BkTxCd   ) newTx.BkTxCd    = oldN.BkTxCd
@@ -109,7 +105,7 @@ export default async function handler(req, res) {
       return n
     })
 
-    // 6) Aufbau des finalen JSON-Baums
+    // 6) JSON für XML-Output
     const outJson = {
       Document: {
         '@xmlns':            NEW_NS,
@@ -122,23 +118,28 @@ export default async function handler(req, res) {
       }
     }
 
-    // 7) XML bauen mit Deklaration & Pretty-Print
+    // 7) Builder mit Präfix '@' für Attributes
     const builder = new XMLBuilder({
       ignoreAttributes:    false,
-      attributeNamePrefix: '',
-      declaration:         { include: true, encoding: 'UTF-8', version: '1.0' },
-      format:              true,
-      indentBy:            '  ',
-      suppressEmptyNode:   false
+      attributeNamePrefix: '@',
+      declaration: {
+        include:  true,
+        encoding: 'UTF-8',
+        version:  '1.0'
+      },
+      format:    true,
+      indentBy:  '  ',
+      suppressEmptyNode: false
     })
+
     const outXml = builder.build(outJson)
 
-    // 8) Response
+    // 8) Zurückliefern
     res.setHeader('Content-Type', 'application/xml')
     res.status(200).send(outXml)
 
   } catch (err) {
-    console.error('🔥 Error in /api/convert:', err)
+    console.error('Error in /api/convert:', err)
     res.status(500).send('Server error')
   }
 }
