@@ -1,88 +1,64 @@
-// convert.js
-// Konvertiert camt.053.001.04 zu camt.053.001.08 mit korrekter Struktur
-
+const formidable = require('formidable');
 const fs = require('fs');
-const { DOMParser, XMLSerializer } = require('xmldom');
 const xpath = require('xpath');
+const { DOMParser, XMLSerializer } = require('@xmldom/xmldom');
 
-const OLD_NS = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.04';
-const NEW_NS = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.08';
-const XSI_NS = 'http://www.w3.org/2001/XMLSchema-instance';
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
 
-function convert(inputXml) {
-  const doc = new DOMParser().parseFromString(inputXml, 'text/xml');
-  const select = xpath.useNamespaces({ ns: OLD_NS });
+export default async function handler(req, res) {
+  const form = new formidable.IncomingForm();
 
-  // Namespace-Update
-  const document = doc.documentElement;
-  document.setAttribute('xmlns', NEW_NS);
-  document.setAttribute('xmlns:xsi', XSI_NS);
-  document.setAttributeNS(XSI_NS, 'xsi:schemaLocation', `${NEW_NS} camt.053.001.08.xsd`);
-
-  // Konvertiere <Amt>
-  const amts = select('//ns:Amt', doc);
-  for (const amt of amts) {
-    const currency = select('./ns:Ccy', amt)[0];
-    if (currency) {
-      amt.setAttribute('Ccy', currency.textContent);
-      amt.textContent = amt.textContent.replace(currency.textContent, '').trim();
-      amt.removeChild(currency);
+  form.parse(req, async (err, fields, files) => {
+    if (err) {
+      res.status(500).json({ error: 'Fehler beim Parsen des Formulars' });
+      return;
     }
-  }
 
-  // Konvertiere <RltdPties>
-  const rltdPtiesNodes = select('//ns:NtryDtls/ns:TxDtls/ns:RltdPties', doc);
-  for (const oldRltdPties of rltdPtiesNodes) {
-    const newRltdPties = doc.createElementNS(NEW_NS, 'RltdPties');
+    const file = files.file[0];
+    const xmlData = fs.readFileSync(file.filepath, 'utf8');
 
-    // Hole ursprünglichen Namen und Adresse
-    const name = select('.//ns:Nm', oldRltdPties)[0]?.textContent || 'Unbekannt';
-    const adrLine = select('.//ns:AdrLine', oldRltdPties)[0]?.textContent || 'Unbekannt';
-    const iban = select('.//ns:IBAN', oldRltdPties)[0]?.textContent || 'CH0000000000000000000';
+    const doc = new DOMParser().parseFromString(xmlData, 'application/xml');
+    const select = xpath.useNamespaces({
+      ns: 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.04',
+    });
 
-    const cdtr = doc.createElementNS(NEW_NS, 'Cdtr');
-    const pty = doc.createElementNS(NEW_NS, 'Pty');
-    const nm = doc.createElementNS(NEW_NS, 'Nm');
-    nm.textContent = name;
-    const pstlAdr = doc.createElementNS(NEW_NS, 'PstlAdr');
-    const adr = doc.createElementNS(NEW_NS, 'AdrLine');
-    adr.textContent = adrLine;
-    pstlAdr.appendChild(adr);
-    pty.appendChild(nm);
-    pty.appendChild(pstlAdr);
-    cdtr.appendChild(pty);
+    const reltdPtiesNodes = select('//ns:RltdPties', doc);
+    reltdPtiesNodes.forEach(node => {
+      // Entferne bisherige Inhalte
+      while (node.firstChild) node.removeChild(node.firstChild);
 
-    const cdtrAcct = doc.createElementNS(NEW_NS, 'CdtrAcct');
-    const id = doc.createElementNS(NEW_NS, 'Id');
-    const ibanEl = doc.createElementNS(NEW_NS, 'IBAN');
-    ibanEl.textContent = iban;
-    id.appendChild(ibanEl);
-    cdtrAcct.appendChild(id);
+      // Erstelle neuen Inhalt für <RltdPties>
+      const cdtr = doc.createElement('Cdtr');
+      const pty = doc.createElement('Pty');
+      const nm = doc.createElement('Nm');
+      nm.textContent = 'HOSTPOINT AG';
 
-    newRltdPties.appendChild(cdtr);
-    newRltdPties.appendChild(cdtrAcct);
+      const pstlAdr = doc.createElement('PstlAdr');
+      const adrLine = doc.createElement('AdrLine');
+      adrLine.textContent = 'RAPPERSWIL-SG  CHE';
 
-    oldRltdPties.parentNode.replaceChild(newRltdPties, oldRltdPties);
-  }
+      pstlAdr.appendChild(adrLine);
+      pty.appendChild(nm);
+      pty.appendChild(pstlAdr);
+      cdtr.appendChild(pty);
+      node.appendChild(cdtr);
 
-  // <RltdAgts /> statt leerem Element
-  const rltdAgtsNodes = select('//ns:NtryDtls/ns:TxDtls/ns:RltdAgts', doc);
-  for (const node of rltdAgtsNodes) {
-    while (node.firstChild) node.removeChild(node.firstChild);
-  }
+      const cdtrAcct = doc.createElement('CdtrAcct');
+      const id = doc.createElement('Id');
+      const iban = doc.createElement('IBAN');
+      iban.textContent = 'CH7483019KOMUNIQUE000';
+      id.appendChild(iban);
+      cdtrAcct.appendChild(id);
+      node.appendChild(cdtrAcct);
+    });
 
-  return new XMLSerializer().serializeToString(doc);
+    const outputXml = new XMLSerializer().serializeToString(doc);
+
+    res.setHeader('Content-Type', 'application/xml');
+    res.status(200).send(outputXml);
+  });
 }
-
-// Beispielnutzung
-const inputPath = process.argv[2];
-const outputPath = process.argv[3];
-if (!inputPath || !outputPath) {
-  console.error('Usage: node convert.js input.xml output.xml');
-  process.exit(1);
-}
-
-const inputXml = fs.readFileSync(inputPath, 'utf-8');
-const outputXml = convert(inputXml);
-fs.writeFileSync(outputPath, outputXml);
-console.log(`Konvertierung abgeschlossen: ${outputPath}`);
