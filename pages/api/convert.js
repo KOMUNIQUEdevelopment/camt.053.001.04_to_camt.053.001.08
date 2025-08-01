@@ -2,7 +2,9 @@ import formidable from 'formidable'
 import fs from 'fs'
 import { XMLParser, XMLBuilder } from 'fast-xml-parser'
 
-export const config = { api: { bodyParser: false } }
+export const config = {
+  api: { bodyParser: false }
+}
 
 export default async function handler(req, res) {
   const form = new formidable.IncomingForm()
@@ -14,6 +16,7 @@ export default async function handler(req, res) {
   })
 
   const xml = fs.readFileSync(files.file.filepath, 'utf8')
+
   const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: '',
@@ -22,50 +25,45 @@ export default async function handler(req, res) {
 
   let json = parser.parse(xml)
 
-  // 🔧 Fix: konvertiere bestimmte Attribute zu Child-Elementen
-  const fixTxDtls = (jsonNode) => {
-    if (!jsonNode?.BkToCstmrStmt?.Stmt?.Ntry) return
+  // 🔧 FIX: Attribut zu Element in Refs und TxDtls
+  const fixTxDetails = () => {
+    const entries = json?.Document?.BkToCstmrStmt?.Stmt?.Ntry
+    if (!entries) return
 
-    const entries = Array.isArray(jsonNode.BkToCstmrStmt.Stmt.Ntry)
-      ? jsonNode.BkToCstmrStmt.Stmt.Ntry
-      : [jsonNode.BkToCstmrStmt.Stmt.Ntry]
+    const entryList = Array.isArray(entries) ? entries : [entries]
 
-    entries.forEach(entry => {
-      if (!entry.NtryDtls?.TxDtls) return
+    entryList.forEach((entry) => {
+      const txDtlsList = entry?.NtryDtls?.TxDtls
+      if (!txDtlsList) return
 
-      const txList = Array.isArray(entry.NtryDtls.TxDtls)
-        ? entry.NtryDtls.TxDtls
-        : [entry.NtryDtls.TxDtls]
+      const txs = Array.isArray(txDtlsList) ? txDtlsList : [txDtlsList]
 
-      txList.forEach(tx => {
-        // Verschiebe CdtDbtInd aus Attribut zu Element
-        if (tx.CdtDbtInd) return // schon als Element vorhanden
-        if (tx.CdtDbtInd === undefined && tx['CdtDbtInd']) {
-          tx.CdtDbtInd = tx['CdtDbtInd']
-          delete tx['CdtDbtInd']
-        }
-        if (tx.CdtDbtInd === undefined && tx.CdtDbtIndAttr) {
-          tx.CdtDbtInd = tx.CdtDbtIndAttr
-          delete tx.CdtDbtIndAttr
-        }
-
-        // Falls AcctSvcrRef als Attribut in Refs ist, konvertiere zu Child-Element
-        if (tx.Refs && tx.Refs.AcctSvcrRef && typeof tx.Refs.AcctSvcrRef === 'string') {
+      txs.forEach((tx) => {
+        // 👇 Stelle sicher, dass AcctSvcrRef ein Element ist
+        if (tx.Refs && typeof tx.Refs.AcctSvcrRef === 'string') {
           tx.Refs = {
-            AcctSvcrRef: tx.Refs.AcctSvcrRef
+            AcctSvcrRef: {
+              '#text': tx.Refs.AcctSvcrRef
+            }
           }
+        }
+
+        // 👇 Dasselbe für CdtDbtInd falls notwendig
+        if (typeof tx.CdtDbtInd === 'string') {
+          tx.CdtDbtInd = { '#text': tx.CdtDbtInd }
         }
       })
     })
   }
 
-  fixTxDtls(json)
+  fixTxDetails()
 
   const builder = new XMLBuilder({
     ignoreAttributes: false,
     attributeNamePrefix: '',
     format: true
   })
+
   const outputXml = builder.build(json)
 
   res.setHeader('Content-Type', 'application/xml')
