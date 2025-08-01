@@ -10,24 +10,13 @@ const XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
 
 const STMT_ORDER = ['Id','ElctrncSeqNb','CreDtTm','FrToDt','CpyDplctInd','Acct']
 const STMT_MULTI = ['Bal','Ntry']
-const NTRY_ORDER = ['NtryRef','Amt','CdtDbtInd','RvslInd','Sts','BookgDt','ValDt','AcctSvcrRef','BkTxCd','NtryDtls','AmtDtls','AddtlNtryInf']
-const TX_ORDER = ['Refs','Amt','CdtDbtInd','BkTxCd','RmtInf','AmtDtls','RltdPties','RltdAgts']
+const NTRY_ORDER = ['NtryRef','Amt','CdtDbtInd','RvslInd','Sts','BookgDt','ValDt','AcctSvcrRef','BkTxCd','NtryDtls','AddtlNtryInf']
+const TX_ORDER = ['Refs','Amt','CdtDbtInd','AmtDtls','BkTxCd','RltdPties','RltdAgts','RmtInf']
 
 function ensureArray(value) {
   if (Array.isArray(value)) return value
   if (value != null) return [value]
   return []
-}
-
-function deepCopy(obj) {
-  if (obj === null || typeof obj !== 'object') return obj
-  if (Array.isArray(obj)) return obj.map(deepCopy)
-  
-  const copy = {}
-  for (const [key, value] of Object.entries(obj)) {
-    copy[key] = deepCopy(value)
-  }
-  return copy
 }
 
 function reorderObject(obj, order, multi = []) {
@@ -47,63 +36,12 @@ function reorderObject(obj, order, multi = []) {
     }
   })
   
-  // Schließlich alle anderen
+  // Alle anderen Felder
   Object.keys(obj).forEach(key => {
     if (!order.includes(key) && !multi.includes(key)) {
       result[key] = obj[key]
     }
   })
-  
-  return result
-}
-
-function fixAmountAttributes(obj) {
-  if (!obj || typeof obj !== 'object') return obj
-  
-  if (Array.isArray(obj)) {
-    return obj.map(fixAmountAttributes)
-  }
-  
-  const result = {}
-  for (const [key, value] of Object.entries(obj)) {
-    if (key === 'Amt' && value && typeof value === 'object' && value['#text'] && value['Ccy']) {
-      // Konvertiere zu Attribut-Format
-      result[key] = {
-        '#text': value['#text'],
-        '@_Ccy': value['Ccy']
-      }
-    } else if (key === 'InstdAmt' && value && typeof value === 'object' && value['#text'] && value['Ccy']) {
-      // Für InstdAmt auch Attribut-Format
-      result[key] = {
-        '#text': value['#text'],
-        '@_Ccy': value['Ccy']
-      }
-    } else {
-      result[key] = fixAmountAttributes(value)
-    }
-  }
-  return result
-}
-
-function transformRltdPties(rltdPties) {
-  if (!rltdPties) return null
-  
-  const result = {}
-  
-  // DbtrAcct -> CdtrAcct
-  if (rltdPties.DbtrAcct) {
-    result.CdtrAcct = rltdPties.DbtrAcct
-  }
-  
-  // Cdtr mit Pty wrapper
-  if (rltdPties.Cdtr) {
-    result.Cdtr = {
-      Pty: {
-        Nm: rltdPties.Cdtr.Nm,
-        ...(rltdPties.Cdtr.PstlAdr && { PstlAdr: rltdPties.Cdtr.PstlAdr })
-      }
-    }
-  }
   
   return result
 }
@@ -126,95 +64,108 @@ export default async function handler(req, res) {
     
     const parser = new XMLParser({
       ignoreAttributes: false,
-      attributeNamePrefix: '@_',
+      attributeNamePrefix: '@',
       textNodeName: '#text',
       preserveOrder: false
     })
 
-    const json = parser.parse(xml)
+    const jsonObj = parser.parse(xml)
     
-    // Get AddtlInf from GrpHdr for default description
-    const grpText = json?.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || 'SPS/1.7.1/PROD'
+    // GrpHdr AddtlInf als Standard-Beschreibung
+    const grpText = jsonObj?.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || ''
     
-    // Deep copy and transform
-    let newJson = deepCopy(json)
+    // Namespace aktualisieren
+    jsonObj.Document['@xmlns'] = NEW_NS
+    jsonObj.Document['@xmlns:xsi'] = XSI_NS
+    jsonObj.Document['@xsi:schemaLocation'] = `${NEW_NS} camt.053.001.08.xsd`
     
-    // Update namespaces
-    newJson.Document['@_xmlns'] = NEW_NS
-    newJson.Document['@_xmlns:xsi'] = XSI_NS
-    newJson.Document['@_xsi:schemaLocation'] = `${NEW_NS} camt.053.001.08.xsd`
+    // Stmt reorganisieren
+    const stmt = jsonObj.Document.BkToCstmrStmt.Stmt
+    const reorderedStmt = reorderObject(stmt, STMT_ORDER, STMT_MULTI)
     
-    // Fix LastPgInd - sollte "true" Text haben, nicht empty
-    if (newJson.Document?.BkToCstmrStmt?.GrpHdr?.MsgPgntn?.LastPgInd !== undefined) {
-      newJson.Document.BkToCstmrStmt.GrpHdr.MsgPgntn.LastPgInd = 'true'
-    }
-    
-    // Process Stmt
-    const stmt = newJson.Document.BkToCstmrStmt.Stmt
-    if (stmt) {
-      // Reorder Stmt
-      newJson.Document.BkToCstmrStmt.Stmt = reorderObject(stmt, STMT_ORDER, STMT_MULTI)
+    // Ntry-Einträge verarbeiten
+    const entries = ensureArray(reorderedStmt.Ntry)
+    reorderedStmt.Ntry = entries.map(entry => {
+      const reorderedEntry = reorderObject(entry, NTRY_ORDER)
       
-      // Process Entries
-      const entries = ensureArray(newJson.Document.BkToCstmrStmt.Stmt.Ntry)
-      newJson.Document.BkToCstmrStmt.Stmt.Ntry = entries.map(entry => {
-        // Reorder Ntry
-        const reorderedEntry = reorderObject(entry, NTRY_ORDER)
+      // TxDtls verarbeiten
+      if (reorderedEntry.NtryDtls?.TxDtls) {
+        const txDtls = reorderedEntry.NtryDtls.TxDtls
+        const reorderedTx = reorderObject(txDtls, TX_ORDER)
         
-        // Process TxDtls
-        if (reorderedEntry.NtryDtls?.TxDtls) {
-          const tx = reorderedEntry.NtryDtls.TxDtls
-          
-          // Transform RltdPties
-          if (tx.RltdPties) {
-            tx.RltdPties = transformRltdPties(tx.RltdPties)
-          }
-          
-          // Add missing RmtInf second Ustrd
-          if (tx.RmtInf) {
-            if (typeof tx.RmtInf.Ustrd === 'string') {
-              tx.RmtInf.Ustrd = [tx.RmtInf.Ustrd, grpText]
-            } else if (Array.isArray(tx.RmtInf.Ustrd) && tx.RmtInf.Ustrd.length === 1) {
-              tx.RmtInf.Ustrd.push(grpText)
+        // AmtDtls hinzufügen falls fehlt
+        if (!reorderedTx.AmtDtls && reorderedTx.Amt) {
+          reorderedTx.AmtDtls = {
+            InstdAmt: {
+              '@Ccy': reorderedTx.Amt['@Ccy'],
+              '#text': reorderedTx.Amt['#text']
             }
           }
+        }
+        
+        // RltdPties korrigieren
+        if (reorderedTx.RltdPties) {
+          const rltdPties = reorderedTx.RltdPties
           
-          // Add empty RltdAgts if missing
-          if (!tx.RltdAgts) {
-            tx.RltdAgts = null // Dies wird zu <RltdAgts/> 
+          // DbtrAcct zu CdtrAcct umbenennen
+          if (rltdPties.DbtrAcct) {
+            rltdPties.CdtrAcct = rltdPties.DbtrAcct
+            delete rltdPties.DbtrAcct
           }
           
-          // Reorder TxDtls
-          reorderedEntry.NtryDtls.TxDtls = reorderObject(tx, TX_ORDER)
+          // Cdtr mit Pty wrapper
+          if (rltdPties.Cdtr && !rltdPties.Cdtr.Pty) {
+            const cdtrContent = { ...rltdPties.Cdtr }
+            rltdPties.Cdtr = { Pty: cdtrContent }
+          }
         }
         
-        // Ensure AddtlNtryInf exists
-        if (!reorderedEntry.AddtlNtryInf) {
-          reorderedEntry.AddtlNtryInf = grpText
+        // RmtInf korrigieren
+        if (!reorderedTx.RmtInf) {
+          reorderedTx.RmtInf = { Ustrd: [grpText] }
+        } else if (reorderedTx.RmtInf.Ustrd) {
+          const ustrdArray = ensureArray(reorderedTx.RmtInf.Ustrd)
+          if (!ustrdArray.includes(grpText)) {
+            ustrdArray.push(grpText)
+          }
+          reorderedTx.RmtInf.Ustrd = ustrdArray
         }
         
-        return reorderedEntry
-      })
-    }
+        // RltdAgts hinzufügen falls fehlt
+        if (!reorderedTx.RltdAgts) {
+          reorderedTx.RltdAgts = null
+        }
+        
+        reorderedEntry.NtryDtls.TxDtls = reorderedTx
+      }
+      
+      // AddtlNtryInf hinzufügen falls fehlt
+      if (!reorderedEntry.AddtlNtryInf) {
+        reorderedEntry.AddtlNtryInf = grpText
+      }
+      
+      return reorderedEntry
+    })
     
-    // Fix amount attributes
-    newJson = fixAmountAttributes(newJson)
+    jsonObj.Document.BkToCstmrStmt.Stmt = reorderedStmt
     
     const builder = new XMLBuilder({
       ignoreAttributes: false,
-      attributeNamePrefix: '@_',
+      attributeNamePrefix: '@',
       textNodeName: '#text',
       format: true,
       indentBy: '  ',
-      suppressEmptyNode: false,
-      suppressBooleanAttributes: false
+      suppressEmptyNode: false
     })
 
-    const xmlOutput = builder.build(newJson)
-    const declaration = `<?xml version='1.0' encoding='UTF-8'?>\n`
+    const xmlOutput = builder.build(jsonObj)
     
+    // Nur EINE XML-Deklaration
+    const finalXml = `<?xml version='1.0' encoding='UTF-8'?>\n${xmlOutput}`
+
     res.setHeader('Content-Type', 'application/xml')
-    res.status(200).send(declaration + xmlOutput)
+    res.setHeader('Content-Disposition', 'attachment; filename="converted.xml"')
+    res.status(200).send(finalXml)
 
   } catch (error) {
     console.error('Conversion error:', error)
