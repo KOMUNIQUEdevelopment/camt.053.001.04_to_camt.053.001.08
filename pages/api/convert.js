@@ -4,9 +4,7 @@ import formidable from 'formidable'
 import fs from 'fs'
 import { XMLParser, XMLBuilder } from 'fast-xml-parser'
 
-export const config = {
-  api: { bodyParser: false }
-}
+export const config = { api: { bodyParser: false } }
 
 // Namespaces und Sortier-Arrays
 const OLD_NS     = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.04'
@@ -35,41 +33,35 @@ function reorderObject(obj, order, multi = []) {
 
 export default async function handler(req, res) {
   try {
-    // 1) Multipart-Formular parsen
+    // Datei aus dem Formular lesen
     const form = new formidable.IncomingForm()
-    const { fields, files } = await new Promise((resolve, reject) => {
+    const { files } = await new Promise((resolve, reject) => {
       form.parse(req, (err, fields, files) =>
         err ? reject(err) : resolve({ fields, files })
       )
     })
     const file = files.file
-    if (!file) {
-      res.status(400).send('No file uploaded')
-      return
-    }
+    if (!file) return res.status(400).send('No file uploaded')
     const path = file.filepath || file.path
-    if (!fs.existsSync(path)) {
-      res.status(400).send(`File not found: ${path}`)
-      return
-    }
+    if (!fs.existsSync(path)) return res.status(400).send(`File not found: ${path}`)
 
-    // 2) XML einlesen & parsen
+    // XML lesen & parsen
     const xml = fs.readFileSync(path, 'utf8')
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
     const docJson = parser.parse(xml)
 
-    // 3) Fallback-Text aus GrpHdr/AddtlInf
-    const grpText = (docJson.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf) || ''
+    // Fallback-Text
+    const grpText = docJson.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || ''
 
-    // 4) <Stmt> neu sortieren
+    // Stmt neu sortieren
     const stmtIn  = docJson.Document.BkToCstmrStmt.Stmt
     const newStmt = reorderObject(stmtIn, STMT_ORDER, STMT_MULTI)
 
-    // 5) Jede Buchung (<Ntry>) transformieren
+    // Jede Ntry transformieren
     const oldEntries = ensureArray(stmtIn.Ntry)
     newStmt.Ntry = oldEntries.map(oldN => {
       const n = {}
-      // 5a) Ntry-Felder in Reihenfolge
+      // Ntry-Felder
       NTRY_ORDER.forEach(tag => {
         if (tag === 'NtryDtls') {
           if (oldN.NtryDtls) n.NtryDtls = oldN.NtryDtls
@@ -79,17 +71,12 @@ export default async function handler(req, res) {
           n[tag] = oldN[tag]
         }
       })
-      // 5b) TxDtls transformieren & Fallbacks
+      // TxDtls & Fallbacks
       if (n.NtryDtls?.TxDtls) {
         const txIn  = n.NtryDtls.TxDtls
         const newTx = reorderObject(txIn, TX_ORDER)
         if (!newTx.AmtDtls && txIn.Amt) {
-          newTx.AmtDtls = {
-            InstdAmt: {
-              '#text': txIn.Amt['#text'],
-              Ccy:     txIn.Amt.Ccy
-            }
-          }
+          newTx.AmtDtls = { InstdAmt: { '#text': txIn.Amt['#text'], Ccy: txIn.Amt.Ccy } }
         }
         if (!newTx.RmtInf) {
           newTx.RmtInf = { Ustrd: n.AddtlNtryInf }
@@ -102,7 +89,7 @@ export default async function handler(req, res) {
       return n
     })
 
-    // 6) Neuer JSON-Baum für XML
+    // JSON für Builder
     const outJson = {
       Document: {
         xmlns:              NEW_NS,
@@ -115,27 +102,22 @@ export default async function handler(req, res) {
       }
     }
 
-    // 7) XML bauen mit Deklaration & Pretty-Print
+    // XML erstellen ohne automatische Deklaration
     const builder = new XMLBuilder({
       ignoreAttributes:    false,
       attributeNamePrefix: '',
-      declaration: {
-        include:  true,
-        encoding: 'UTF-8',
-        version:  '1.0'
-      },
-      format:            true,
-      indentBy:          '  ',
-      suppressEmptyNode: false
+      format:              true,
+      indentBy:            '  ',
+      suppressEmptyNode:   false
     })
-    let outXml = builder.build(outJson)
+    const xmlBody = builder.build(outJson)
 
-    // 8) Anpassung der Deklaration auf einfache Anführungszeichen & Leerzeile
-    outXml = outXml.replace(/^<\?xml .*?\?>/, decl => decl.replace(/"/g, "'") + "\n")
+    // Manuell XML-Deklaration wie Python
+    const declaration = "<?xml version='1.0' encoding='UTF-8'?>\n\n"
 
-    // 9) Abschließender Zeilenumbruch
+    // Response
     res.setHeader('Content-Type', 'application/xml')
-    res.status(200).send(outXml + "\n")
+    res.status(200).send(declaration + xmlBody + '\n')
 
   } catch (err) {
     console.error('Error in /api/convert:', err)
