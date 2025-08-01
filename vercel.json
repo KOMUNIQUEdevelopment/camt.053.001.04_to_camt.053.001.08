@@ -1,7 +1,13 @@
 {
   "version": 2,
   "builds": [
-    { "src": "package.json", "use": "@vercel/static-build" },
-    { "src": "pages/api/*.js", "use": "@vercel/node" }
+    {
+      "src": "package.json",
+      "use": "@vercel/next"
+    },
+    {
+      "src": "pages/api/**/*.js",
+      "use": "@vercel/node"
+    }
   ]
 }
