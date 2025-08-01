@@ -16,7 +16,8 @@ export default async function handler(req, res) {
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
   const json = parser.parse(xml)
 
-  // TODO: Implement transformation logic here
+  // TODO: Hier die Transformation implementieren,
+  // analog zum Python-Skript (Umbenennen/Namensraum/etc.)
 
   const builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '' })
   const outputXml = builder.build(json)
