@@ -53,7 +53,7 @@ export default async function handler(req, res) {
       return
     }
 
-    // 2) XML einlesen und parsen
+    // 2) XML einlesen & parsen
     const xml = fs.readFileSync(path, 'utf8')
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
     const docJson = parser.parse(xml)
@@ -131,11 +131,11 @@ export default async function handler(req, res) {
     let outXml = builder.build(outJson)
 
     // 8) Anpassung der Deklaration auf einfache Anführungszeichen & Leerzeile
-    outXml = outXml.replace(/^\<\?xml .*?\?\>/, decl => decl.replace(/\"/g, \"'\") + \"\n\")
+    outXml = outXml.replace(/^<\?xml .*?\?>/, decl => decl.replace(/"/g, "'") + "\n")
 
     // 9) Abschließender Zeilenumbruch
     res.setHeader('Content-Type', 'application/xml')
-    res.status(200).send(outXml + '\n')
+    res.status(200).send(outXml + "\n")
 
   } catch (err) {
     console.error('Error in /api/convert:', err)
