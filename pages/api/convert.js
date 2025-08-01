@@ -35,7 +35,7 @@ function reorderObject(obj, order, multi = []) {
 
 export default async function handler(req, res) {
   try {
-    // 1) Upload parsen
+    // 1) Multipart-Formular parsen
     const form = new formidable.IncomingForm()
     const { fields, files } = await new Promise((resolve, reject) => {
       form.parse(req, (err, fields, files) =>
@@ -58,18 +58,19 @@ export default async function handler(req, res) {
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
     const docJson = parser.parse(xml)
 
-    // 3) Gruppentext für Fallback
+    // 3) Fallback-Text aus GrpHdr/AddtlInf
     const grpText = ((docJson.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf) ?? '') || ''
 
     // 4) <Stmt> neu sortieren
     const stmtIn  = docJson.Document.BkToCstmrStmt.Stmt
     const newStmt = reorderObject(stmtIn, STMT_ORDER, STMT_MULTI)
 
-    // 5) Jede Buchung (<Ntry>) umwandeln
+    // 5) Jede Buchung transformieren
     const oldEntries = ensureArray(stmtIn.Ntry)
     newStmt.Ntry = oldEntries.map(oldN => {
       const n = {}
-      // 5a) Ntry-Felder in korrekter Reihenfolge
+
+      // 5a) <Ntry>-Felder in korrekter Reihenfolge
       NTRY_ORDER.forEach(tag => {
         if (tag === 'NtryDtls') {
           if (oldN.NtryDtls) n.NtryDtls = oldN.NtryDtls
@@ -80,7 +81,7 @@ export default async function handler(req, res) {
         }
       })
 
-      // 5b) TxDtls transformieren & Fallbacks
+      // 5b) <TxDtls> transformieren & Fallbacks
       if (n.NtryDtls?.TxDtls) {
         const txIn  = n.NtryDtls.TxDtls
         const newTx = reorderObject(txIn, TX_ORDER)
@@ -88,7 +89,10 @@ export default async function handler(req, res) {
         // fallback <AmtDtls>
         if (!newTx.AmtDtls && txIn.Amt) {
           newTx.AmtDtls = {
-            InstdAmt: { '#text': txIn.Amt['#text'], 'Ccy': txIn.Amt.Ccy }
+            InstdAmt: {
+              '#text': txIn.Amt['#text'],
+              'Ccy':   txIn.Amt.Ccy
+            }
           }
         }
         // fallback <RmtInf>
@@ -105,11 +109,11 @@ export default async function handler(req, res) {
       return n
     })
 
-    // 6) Zusammenbauen des neuen XML-Baums als JSON
+    // 6) Aufbau des finalen JSON-Baums
     const outJson = {
       Document: {
-        '@xmlns': NEW_NS,
-        '@xmlns:xsi': XSI_NS,
+        '@xmlns':            NEW_NS,
+        '@xmlns:xsi':        XSI_NS,
         '@xsi:schemaLocation': `${NEW_NS} camt.053.001.08.xsd`,
         BkToCstmrStmt: {
           GrpHdr: docJson.Document.BkToCstmrStmt.GrpHdr,
@@ -118,18 +122,14 @@ export default async function handler(req, res) {
       }
     }
 
-    // 7) XML bauen inkl. Deklaration
+    // 7) XML bauen mit Deklaration & Pretty-Print
     const builder = new XMLBuilder({
-      ignoreAttributes:          false,
-      attributeNamePrefix:       '',
-      // die Deklaration am Anfang:
-      declaration: {
-        include:  true,
-        encoding: 'UTF-8',
-        version:  '1.0'
-      },
-      // leere Tags nicht unterdrücken:
-      suppressEmptyNode: false
+      ignoreAttributes:    false,
+      attributeNamePrefix: '',
+      declaration:         { include: true, encoding: 'UTF-8', version: '1.0' },
+      format:              true,
+      indentBy:            '  ',
+      suppressEmptyNode:   false
     })
     const outXml = builder.build(outJson)
 
