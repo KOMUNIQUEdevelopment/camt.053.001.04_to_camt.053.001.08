@@ -1,5 +1,3 @@
-// pages/api/convert.js
-
 import formidable from 'formidable'
 import fs from 'fs'
 import { XMLParser, XMLBuilder } from 'fast-xml-parser'
@@ -33,7 +31,6 @@ function reorderObject(obj, order, multi = []) {
 
 export default async function handler(req, res) {
   try {
-    // 1) Datei aus Formular laden
     const form = new formidable.IncomingForm()
     const { files } = await new Promise((resolve, reject) => {
       form.parse(req, (err, fields, files) =>
@@ -41,33 +38,21 @@ export default async function handler(req, res) {
       )
     })
     const file = files.file
-    if (!file) {
-      res.status(400).send('No file uploaded')
-      return
-    }
+    if (!file) return res.status(400).send('No file uploaded')
     const path = file.filepath || file.path
-    if (!fs.existsSync(path)) {
-      res.status(400).send(`File not found: ${path}`)
-      return
-    }
+    if (!fs.existsSync(path)) return res.status(400).send(`File not found: ${path}`)
 
-    // 2) XML einlesen & parsen
     const xml = fs.readFileSync(path, 'utf8')
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
     const docJson = parser.parse(xml)
 
-    // 3) Fallback-Text aus GrpHdr/AddtlInf
     const grpText = docJson.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || ''
-
-    // 4) <Stmt> neu sortieren
     const stmtIn  = docJson.Document.BkToCstmrStmt.Stmt
     const newStmt = reorderObject(stmtIn, STMT_ORDER, STMT_MULTI)
 
-    // 5) Buchungen transformieren
     const oldEntries = ensureArray(stmtIn.Ntry)
     newStmt.Ntry = oldEntries.map(oldN => {
       const n = {}
-      // 5a) Ntry-Felder in Reihenfolge
       NTRY_ORDER.forEach(tag => {
         if (tag === 'NtryDtls') {
           if (oldN.NtryDtls) n.NtryDtls = oldN.NtryDtls
@@ -77,30 +62,23 @@ export default async function handler(req, res) {
           n[tag] = oldN[tag]
         }
       })
-      // 5b) TxDtls transformieren & Fallbacks
       if (n.NtryDtls?.TxDtls) {
         const txIn  = n.NtryDtls.TxDtls
         const newTx = reorderObject(txIn, TX_ORDER)
         if (!newTx.AmtDtls && txIn.Amt) {
-          newTx.AmtDtls = {
-            InstdAmt: {
-              '#text': txIn.Amt['#text'],
-              Ccy:     txIn.Amt.Ccy
-            }
-          }
+          newTx.AmtDtls = { InstdAmt: { '#text': txIn.Amt['#text'], Ccy: txIn.Amt.Ccy } }
         }
         if (!newTx.RmtInf) {
           newTx.RmtInf = { Ustrd: n.AddtlNtryInf }
         }
-        if (!newTx.RltdPties && oldN.RltdPties)   newTx.RltdPties = oldN.RltdPties
-        if (!newTx.RltdAgts  && oldN.RltdAgts )   newTx.RltdAgts  = oldN.RltdAgts
-        if (!newTx.BkTxCd    && oldN.BkTxCd   )   newTx.BkTxCd    = oldN.BkTxCd
+        if (!newTx.RltdPties && oldN.RltdPties) newTx.RltdPties = oldN.RltdPties
+        if (!newTx.RltdAgts  && oldN.RltdAgts ) newTx.RltdAgts  = oldN.RltdAgts
+        if (!newTx.BkTxCd    && oldN.BkTxCd   ) newTx.BkTxCd    = oldN.BkTxCd
         n.NtryDtls.TxDtls = newTx
       }
       return n
     })
 
-    // 6) JSON für Builder
     const outJson = {
       Document: {
         xmlns:              NEW_NS,
@@ -113,22 +91,22 @@ export default async function handler(req, res) {
       }
     }
 
-    // 7) Body pretty-printen
     const builder = new XMLBuilder({
       ignoreAttributes:    false,
-      attributeNamePrefix: '',
+      attributeNamePrefix: '@',  // Prefix für Attribute
+      textNodeName: '#text',
       format:              true,
       indentBy:            '  ',
       suppressEmptyNode:   false
     })
     const xmlBody = builder.build(outJson)
+    const xmlBody = builder.build(outJson)
+    const declaration = "<?xml version='1.0' encoding='UTF-8'?>
 
-    // 8) Manuell Deklaration
-    const declaration = "<?xml version='1.0' encoding='UTF-8'?>\n\n"
-
-    // 9) Antwort
+"
     res.setHeader('Content-Type', 'application/xml')
-    res.status(200).send(declaration + xmlBody + '\n')
+    res.status(200).send(declaration + xmlBody + '
+')
 
   } catch (err) {
     console.error('Error in /api/convert:', err)
