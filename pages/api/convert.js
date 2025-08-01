@@ -19,98 +19,117 @@ function ensureArray(value) {
   return []
 }
 
+function copyWithNewNamespace(obj, visited = new Set()) {
+  if (obj === null || typeof obj !== 'object') return obj
+  if (visited.has(obj)) return obj
+  visited.add(obj)
+
+  if (Array.isArray(obj)) {
+    return obj.map(item => copyWithNewNamespace(item, visited))
+  }
+
+  const result = {}
+  for (const [key, value] of Object.entries(obj)) {
+    result[key] = copyWithNewNamespace(value, visited)
+  }
+  return result
+}
+
 function reorderObject(obj, order, multi = []) {
   const result = {}
-  
-  // Zuerst die geordneten Felder
+
   order.forEach(key => {
-    if (obj.hasOwnProperty(key)) {
+    if (obj[key] !== undefined) {
       result[key] = obj[key]
     }
   })
-  
-  // Dann die Multi-Felder
+
   multi.forEach(key => {
-    if (obj.hasOwnProperty(key)) {
+    if (obj[key] !== undefined) {
       result[key] = obj[key]
     }
   })
-  
-  // Schließlich alle anderen Felder
+
   Object.keys(obj).forEach(key => {
     if (!order.includes(key) && !multi.includes(key)) {
       result[key] = obj[key]
     }
   })
-  
+
   return result
 }
 
-function copyWithNewNamespace(obj) {
-  if (obj === null || typeof obj !== 'object') return obj
-  if (Array.isArray(obj)) return obj.map(copyWithNewNamespace)
-  
-  const result = {}
-  Object.keys(obj).forEach(key => {
-    result[key] = copyWithNewNamespace(obj[key])
-  })
-  return result
-}
+function normalizeRltdPties(tx, oldNtry) {
+  delete tx.RltdPties
+  const oldRltdPties = oldNtry.RltdPties
+  if (!oldRltdPties) return
 
-function fixAttributeFormat(obj) {
-  if (!obj || typeof obj !== 'object') return obj
-  if (Array.isArray(obj)) return obj.map(fixAttributeFormat)
-  
-  const result = {}
-  Object.keys(obj).forEach(key => {
-    if (key === 'Amt' && obj[key] && typeof obj[key] === 'object' && obj[key]['#text'] && obj[key]['Ccy']) {
-      // Konvertiere <Amt><#text>9</#text><Ccy>CHF</Ccy></Amt> zu <Amt Ccy="CHF">9</Amt>
-      result[key] = {
-        '#text': obj[key]['#text'],
-        '@_Ccy': obj[key]['Ccy']
-      }
-    } else if (key === 'InstdAmt' && obj[key] && typeof obj[key] === 'object' && obj[key]['#text'] && obj[key]['Ccy']) {
-      // Gleiches für InstdAmt
-      result[key] = {
-        '#text': obj[key]['#text'],
-        '@_Ccy': obj[key]['Ccy']
-      }
-    } else {
-      result[key] = fixAttributeFormat(obj[key])
+  const newRltdPties = copyWithNewNamespace(oldRltdPties)
+
+  if (newRltdPties.DbtrAcct) {
+    newRltdPties.CdtrAcct = newRltdPties.DbtrAcct
+    delete newRltdPties.DbtrAcct
+  }
+
+  if (newRltdPties.Dbtr) {
+    newRltdPties.Cdtr = newRltdPties.Dbtr
+    delete newRltdPties.Dbtr
+  }
+
+  if (newRltdPties.Cdtr && !newRltdPties.Cdtr.Pty) {
+    const cdtrContent = { ...newRltdPties.Cdtr }
+    newRltdPties.Cdtr = { Pty: cdtrContent }
+  }
+
+  const pstlAdr = newRltdPties.Cdtr?.Pty?.PstlAdr
+  if (pstlAdr && pstlAdr.AdrLine) {
+    const adrLines = ensureArray(pstlAdr.AdrLine)
+    if (adrLines.length > 0 && !pstlAdr.StrtNm) {
+      pstlAdr.StrtNm = adrLines[0]
     }
-  })
-  return result
+    delete pstlAdr.AdrLine
+  }
+
+  const orderedRltdPties = {}
+  if (newRltdPties.Cdtr) orderedRltdPties.Cdtr = newRltdPties.Cdtr
+  if (newRltdPties.CdtrAcct) orderedRltdPties.CdtrAcct = newRltdPties.CdtrAcct
+
+  tx.RltdPties = orderedRltdPties
 }
 
-function transformRltdPties(oldEntry) {
-  const oldRltdPties = oldEntry.RltdPties
-  if (!oldRltdPties) return null
-  
-  const result = {}
-  
-  // Dbtr -> Cdtr transformieren
-  if (oldRltdPties.Dbtr) {
-    result.Cdtr = {
-      Pty: oldRltdPties.Dbtr
+function copyRmtInf(tx, oldNtry, grpText) {
+  if (!tx.RmtInf) tx.RmtInf = {}
+
+  const ustrdArray = []
+
+  const oldRmtInf = oldNtry.NtryDtls?.TxDtls?.RmtInf || oldNtry.RmtInf
+  if (oldRmtInf) {
+    const oldUstrd = ensureArray(oldRmtInf.Ustrd)
+    ustrdArray.push(...oldUstrd)
+
+    if (oldRmtInf.Strd) {
+      const strdArray = ensureArray(oldRmtInf.Strd)
+      strdArray.forEach(strd => {
+        if (strd.AddtlRmtInf) {
+          const addtlArray = ensureArray(strd.AddtlRmtInf)
+          ustrdArray.push(...addtlArray)
+        }
+      })
     }
   }
-  
-  // DbtrAcct -> CdtrAcct transformieren  
-  if (oldRltdPties.DbtrAcct) {
-    result.CdtrAcct = oldRltdPties.DbtrAcct
+
+  if (grpText) {
+    ustrdArray.push(grpText)
   }
-  
-  return result
+
+  tx.RmtInf.Ustrd = ustrdArray.length > 1 ? ustrdArray : ustrdArray[0] || grpText
 }
 
 export default async function handler(req, res) {
   try {
     const form = new formidable.IncomingForm()
-    
     const { files } = await new Promise((resolve, reject) => {
-      form.parse(req, (err, fields, files) =>
-        err ? reject(err) : resolve({ fields, files })
-      )
+      form.parse(req, (err, fields, files) => err ? reject(err) : resolve({ fields, files }))
     })
 
     if (!files.file) {
@@ -118,120 +137,100 @@ export default async function handler(req, res) {
     }
 
     const xml = fs.readFileSync(files.file.filepath, 'utf8')
-    
+
     const parser = new XMLParser({
       ignoreAttributes: false,
-      attributeNamePrefix: '@_',
+      attributeNamePrefix: '',
       textNodeName: '#text',
       preserveOrder: false
     })
 
-    const inputData = parser.parse(xml)
-    
-    // Extrahiere GrpHdr AddtlInf für Fallback
-    const grpHdrInfo = inputData?.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || 'SPS/1.7.1/PROD'
-    
-    // Kopiere und transformiere die Daten
-    const outputData = copyWithNewNamespace(inputData)
-    
-    // Update Namespaces
-    outputData.Document['@_xmlns'] = NEW_NS
-    outputData.Document['@_xmlns:xsi'] = XSI_NS
-    outputData.Document['@_xsi:schemaLocation'] = `${NEW_NS} camt.053.001.08.xsd`
-    
-    // Verarbeite Statement
-    const stmt = outputData.Document.BkToCstmrStmt.Stmt
-    const originalEntries = ensureArray(inputData.Document.BkToCstmrStmt.Stmt.Ntry)
-    
-    // Reorder Statement
-    outputData.Document.BkToCstmrStmt.Stmt = reorderObject(stmt, STMT_ORDER, STMT_MULTI)
-    
-    // Verarbeite Entries
-    const newEntries = ensureArray(outputData.Document.BkToCstmrStmt.Stmt.Ntry)
-    
-    newEntries.forEach((entry, index) => {
-      const originalEntry = originalEntries[index]
-      
-      // Reorder Entry
-      const reorderedEntry = reorderObject(entry, NTRY_ORDER)
-      
-      // Verarbeite TxDtls
-      if (reorderedEntry.NtryDtls?.TxDtls) {
-        const txDtls = reorderedEntry.NtryDtls.TxDtls
-        
-        // AmtDtls hinzufügen falls fehlt
-        if (!txDtls.AmtDtls && txDtls.Amt) {
-          txDtls.AmtDtls = {
+    const srcDoc = parser.parse(xml)
+
+    const grpText = srcDoc.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || ''
+    const oldStmt = srcDoc.Document?.BkToCstmrStmt
+    if (!oldStmt) return res.status(400).send('No BkToCstmrStmt found')
+
+    const newDoc = {
+      Document: {
+        '@xmlns': NEW_NS,
+        '@xmlns:xsi': XSI_NS,
+        '@xsi:schemaLocation': `${NEW_NS} camt.053.001.08.xsd`,
+        BkToCstmrStmt: {
+          GrpHdr: copyWithNewNamespace(oldStmt.GrpHdr),
+          Stmt: copyWithNewNamespace(oldStmt.Stmt)
+        }
+      }
+    }
+
+    const newStmt = newDoc.Document.BkToCstmrStmt.Stmt
+    newDoc.Document.BkToCstmrStmt.Stmt = reorderObject(newStmt, STMT_ORDER, STMT_MULTI)
+
+    const oldEntries = ensureArray(oldStmt.Stmt.Ntry)
+    const newEntries = ensureArray(newDoc.Document.BkToCstmrStmt.Stmt.Ntry)
+
+    for (let i = 0; i < oldEntries.length && i < newEntries.length; i++) {
+      const oldNtry = oldEntries[i]
+      const newNtry = newEntries[i]
+
+      // Ntry.Amt korrigieren
+      if (newNtry.Amt && typeof newNtry.Amt === 'object') {
+        const currency = newNtry.Amt['@Ccy'] || newNtry.Amt.Ccy
+        const amountText = newNtry.Amt['#text'] || newNtry.Amt
+        newNtry.Amt = {
+          '@Ccy': currency,
+          '#text': amountText
+        }
+      }
+
+      newEntries[i] = reorderObject(newNtry, NTRY_ORDER)
+
+      const tx = newEntries[i].NtryDtls?.TxDtls
+      if (tx) {
+        newEntries[i].NtryDtls.TxDtls = reorderObject(tx, TX_ORDER)
+        const sortedTx = newEntries[i].NtryDtls.TxDtls
+
+        if (!sortedTx.AmtDtls && sortedTx.Amt) {
+          const currency = sortedTx.Amt['@Ccy'] || sortedTx.Amt.Ccy
+          const amountText = sortedTx.Amt['#text'] || sortedTx.Amt
+          sortedTx.AmtDtls = {
             InstdAmt: {
-              '#text': txDtls.Amt['#text'] || txDtls.Amt,
-              Ccy: txDtls.Amt['@_Ccy'] || txDtls.Amt.Ccy
+              '@Ccy': currency,
+              '#text': amountText
             }
           }
         }
-        
-        // RltdPties transformieren
-        const transformedRltdPties = transformRltdPties(originalEntry)
-        if (transformedRltdPties) {
-          txDtls.RltdPties = transformedRltdPties
+
+        normalizeRltdPties(sortedTx, oldNtry)
+
+        if (!sortedTx.RltdAgts) {
+          sortedTx.RltdAgts = oldNtry.RltdAgts ? copyWithNewNamespace(oldNtry.RltdAgts) : {}
         }
-        
-        // RltdAgts hinzufügen (leer)
-        if (!txDtls.RltdAgts) {
-          txDtls.RltdAgts = null // Wird zu <RltdAgts/>
-        }
-        
-        // RmtInf sicherstellen
-        if (!txDtls.RmtInf) {
-          txDtls.RmtInf = {
-            Ustrd: [grpHdrInfo]
-          }
-        } else if (txDtls.RmtInf.Ustrd && !Array.isArray(txDtls.RmtInf.Ustrd)) {
-          txDtls.RmtInf.Ustrd = [txDtls.RmtInf.Ustrd, grpHdrInfo]
-        }
-        
-        // Reorder TxDtls
-        reorderedEntry.NtryDtls.TxDtls = reorderObject(txDtls, TX_ORDER)
+
+        copyRmtInf(sortedTx, oldNtry, grpText)
       }
-      
-      // AmtDtls auf Entry-Level hinzufügen
-      if (!reorderedEntry.AmtDtls && reorderedEntry.Amt) {
-        reorderedEntry.AmtDtls = {
-          InstdAmt: {
-            Amt: {
-              '#text': reorderedEntry.Amt['#text'] || reorderedEntry.Amt,
-              Ccy: reorderedEntry.Amt['@_Ccy'] || reorderedEntry.Amt.Ccy
-            }
-          }
-        }
+
+      if (!newEntries[i].AddtlNtryInf) {
+        newEntries[i].AddtlNtryInf = grpText
       }
-      
-      // AddtlNtryInf sicherstellen
-      if (!reorderedEntry.AddtlNtryInf) {
-        reorderedEntry.AddtlNtryInf = grpHdrInfo
-      }
-      
-      // Entry ersetzen
-      Object.keys(entry).forEach(key => delete entry[key])
-      Object.assign(entry, reorderedEntry)
-    })
-    
-    // Attribut-Format korrigieren
-    const fixedData = fixAttributeFormat(outputData)
-    
+    }
+
+    newDoc.Document.BkToCstmrStmt.Stmt.Ntry = newEntries
+
     const builder = new XMLBuilder({
       ignoreAttributes: false,
-      attributeNamePrefix: '@_',
+      attributeNamePrefix: '@',
       textNodeName: '#text',
       format: true,
       indentBy: '  ',
-      suppressEmptyNode: false,
-      suppressBooleanAttributes: false
+      suppressEmptyNode: false
     })
 
-    const xmlOutput = builder.build(fixedData)
+    const xmlOutput = builder.build(newDoc)
     const declaration = "<?xml version='1.0' encoding='UTF-8'?>\n"
-    
+
     res.setHeader('Content-Type', 'application/xml')
+    res.setHeader('Content-Disposition', 'attachment; filename="converted_camt_08.xml"')
     res.status(200).send(declaration + xmlOutput)
 
   } catch (error) {
