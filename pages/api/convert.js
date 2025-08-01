@@ -1,6 +1,6 @@
 import formidable from 'formidable'
 import fs from 'fs'
-import { XMLParser } from 'fast-xml-parser'
+import { XMLParser, XMLBuilder } from 'fast-xml-parser'
 
 export const config = { api: { bodyParser: false } }
 
@@ -10,8 +10,8 @@ const XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
 
 const STMT_ORDER = ['Id','ElctrncSeqNb','CreDtTm','FrToDt','CpyDplctInd','Acct']
 const STMT_MULTI = ['Bal','Ntry']
-const NTRY_ORDER = ['NtryRef','Amt','CdtDbtInd','RvslInd','Sts','BookgDt','ValDt','AcctSvcrRef','BkTxCd','NtryDtls','AddtlNtryInf']
-const TX_ORDER = ['Refs','Amt','CdtDbtInd','AmtDtls','BkTxCd','RltdPties','RltdAgts','RmtInf']
+const NTRY_ORDER = ['NtryRef','Amt','CdtDbtInd','RvslInd','Sts','BookgDt','ValDt','AcctSvcrRef','BkTxCd','NtryDtls','AmtDtls','AddtlNtryInf']
+const TX_ORDER = ['Refs','Amt','CdtDbtInd','BkTxCd','RmtInf','AmtDtls','RltdPties','RltdAgts']
 
 function ensureArray(value) {
   if (Array.isArray(value)) return value
@@ -19,127 +19,90 @@ function ensureArray(value) {
   return []
 }
 
-function xmlEscape(str) {
-  if (typeof str !== 'string') return str
-  return str.replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&apos;')
+function deepCopy(obj) {
+  if (obj === null || typeof obj !== 'object') return obj
+  if (Array.isArray(obj)) return obj.map(deepCopy)
+  
+  const copy = {}
+  for (const [key, value] of Object.entries(obj)) {
+    copy[key] = deepCopy(value)
+  }
+  return copy
 }
 
-function buildElement(name, obj, indent = 0) {
-  const spaces = '  '.repeat(indent)
+function reorderObject(obj, order, multi = []) {
+  const result = {}
   
-  if (typeof obj === 'string' || typeof obj === 'number') {
-    return `${spaces}<${name}>${xmlEscape(String(obj))}</${name}>`
+  // Erst die geordneten Felder
+  order.forEach(key => {
+    if (obj[key] !== undefined) {
+      result[key] = obj[key]
+    }
+  })
+  
+  // Dann die Multi-Felder
+  multi.forEach(key => {
+    if (obj[key] !== undefined) {
+      result[key] = obj[key]
+    }
+  })
+  
+  // Schließlich alle anderen
+  Object.keys(obj).forEach(key => {
+    if (!order.includes(key) && !multi.includes(key)) {
+      result[key] = obj[key]
+    }
+  })
+  
+  return result
+}
+
+function fixAmountAttributes(obj) {
+  if (!obj || typeof obj !== 'object') return obj
+  
+  if (Array.isArray(obj)) {
+    return obj.map(fixAmountAttributes)
   }
   
-  if (obj === null || obj === undefined) {
-    return `${spaces}<${name}/>`
-  }
-  
-  let attributes = ''
-  let content = []
-  
-  // Handle attributes and content
+  const result = {}
   for (const [key, value] of Object.entries(obj)) {
-    if (key.startsWith('@')) {
-      // Attribute
-      const attrName = key.substring(1)
-      attributes += ` ${attrName}="${xmlEscape(String(value))}"`
-    } else if (key === '#text') {
-      // Text content
-      return `${spaces}<${name}${attributes}>${xmlEscape(String(value))}</${name}>`
+    if (key === 'Amt' && value && typeof value === 'object' && value['#text'] && value['Ccy']) {
+      // Konvertiere zu Attribut-Format
+      result[key] = {
+        '#text': value['#text'],
+        '@_Ccy': value['Ccy']
+      }
+    } else if (key === 'InstdAmt' && value && typeof value === 'object' && value['#text'] && value['Ccy']) {
+      // Für InstdAmt auch Attribut-Format
+      result[key] = {
+        '#text': value['#text'],
+        '@_Ccy': value['Ccy']
+      }
     } else {
-      // Child elements
-      const children = ensureArray(value)
-      for (const child of children) {
-        content.push(buildElement(key, child, indent + 1))
+      result[key] = fixAmountAttributes(value)
+    }
+  }
+  return result
+}
+
+function transformRltdPties(rltdPties) {
+  if (!rltdPties) return null
+  
+  const result = {}
+  
+  // DbtrAcct -> CdtrAcct
+  if (rltdPties.DbtrAcct) {
+    result.CdtrAcct = rltdPties.DbtrAcct
+  }
+  
+  // Cdtr mit Pty wrapper
+  if (rltdPties.Cdtr) {
+    result.Cdtr = {
+      Pty: {
+        Nm: rltdPties.Cdtr.Nm,
+        ...(rltdPties.Cdtr.PstlAdr && { PstlAdr: rltdPties.Cdtr.PstlAdr })
       }
     }
-  }
-  
-  if (content.length === 0) {
-    return `${spaces}<${name}${attributes}/>`
-  }
-  
-  return [
-    `${spaces}<${name}${attributes}>`,
-    ...content,
-    `${spaces}</${name}>`
-  ].join('\n')
-}
-
-function copyWithNamespace(obj, sourceNs, targetNs) {
-  if (typeof obj !== 'object' || obj === null) return obj
-  
-  const result = {}
-  
-  for (const [key, value] of Object.entries(obj)) {
-    if (Array.isArray(value)) {
-      result[key] = value.map(item => copyWithNamespace(item, sourceNs, targetNs))
-    } else if (typeof value === 'object' && value !== null) {
-      result[key] = copyWithNamespace(value, sourceNs, targetNs)
-    } else {
-      result[key] = value
-    }
-  }
-  
-  return result
-}
-
-function reorderObject(obj, order, multiFields = []) {
-  const result = {}
-  const allFields = [...order, ...multiFields]
-  
-  // Add ordered fields first
-  for (const field of order) {
-    if (obj[field] !== undefined) {
-      result[field] = obj[field]
-    }
-  }
-  
-  // Add multi fields
-  for (const field of multiFields) {
-    if (obj[field] !== undefined) {
-      result[field] = obj[field]
-    }
-  }
-  
-  // Add remaining fields
-  for (const [key, value] of Object.entries(obj)) {
-    if (!allFields.includes(key)) {
-      result[key] = value
-    }
-  }
-  
-  return result
-}
-
-function transformRltdPties(oldRltdPties) {
-  if (!oldRltdPties) return null
-  
-  const result = {}
-  
-  // Transform Dbtr -> Cdtr
-  if (oldRltdPties.Dbtr) {
-    result.Cdtr = {
-      Pty: oldRltdPties.Dbtr
-    }
-  }
-  
-  // Transform DbtrAcct -> CdtrAcct  
-  if (oldRltdPties.DbtrAcct) {
-    result.CdtrAcct = oldRltdPties.DbtrAcct
-  }
-  
-  // Keep existing Cdtr/CdtrAcct
-  if (oldRltdPties.Cdtr) {
-    result.Cdtr = oldRltdPties.Cdtr
-  }
-  if (oldRltdPties.CdtrAcct) {
-    result.CdtrAcct = oldRltdPties.CdtrAcct
   }
   
   return result
@@ -163,112 +126,98 @@ export default async function handler(req, res) {
     
     const parser = new XMLParser({
       ignoreAttributes: false,
-      attributeNamePrefix: '@',
+      attributeNamePrefix: '@_',
       textNodeName: '#text',
       preserveOrder: false
     })
 
     const json = parser.parse(xml)
     
-    // Get group header info for default description
-    const grpText = json?.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || ''
+    // Get AddtlInf from GrpHdr for default description
+    const grpText = json?.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || 'SPS/1.7.1/PROD'
     
-    // Copy and transform structure
-    const oldStmt = json.Document.BkToCstmrStmt
-    const newDoc = {
-      Document: {
-        '@xmlns': NEW_NS,
-        '@xmlns:xsi': XSI_NS,
-        '@xsi:schemaLocation': `${NEW_NS} camt.053.001.08.xsd`,
-        BkToCstmrStmt: {
-          GrpHdr: copyWithNamespace(oldStmt.GrpHdr, OLD_NS, NEW_NS),
-          Stmt: {}
-        }
-      }
+    // Deep copy and transform
+    let newJson = deepCopy(json)
+    
+    // Update namespaces
+    newJson.Document['@_xmlns'] = NEW_NS
+    newJson.Document['@_xmlns:xsi'] = XSI_NS
+    newJson.Document['@_xsi:schemaLocation'] = `${NEW_NS} camt.053.001.08.xsd`
+    
+    // Fix LastPgInd - sollte "true" Text haben, nicht empty
+    if (newJson.Document?.BkToCstmrStmt?.GrpHdr?.MsgPgntn?.LastPgInd !== undefined) {
+      newJson.Document.BkToCstmrStmt.GrpHdr.MsgPgntn.LastPgInd = 'true'
     }
     
     // Process Stmt
-    const oldStmtData = oldStmt.Stmt
-    const newStmt = reorderObject(oldStmtData, STMT_ORDER, STMT_MULTI)
-    
-    // Process entries
-    if (newStmt.Ntry) {
-      const entries = ensureArray(newStmt.Ntry)
-      newStmt.Ntry = entries.map(entry => {
-        const newEntry = reorderObject(entry, NTRY_ORDER)
-        
-        // Add AddtlNtryInf if missing
-        if (!newEntry.AddtlNtryInf) {
-          newEntry.AddtlNtryInf = grpText
-        }
+    const stmt = newJson.Document.BkToCstmrStmt.Stmt
+    if (stmt) {
+      // Reorder Stmt
+      newJson.Document.BkToCstmrStmt.Stmt = reorderObject(stmt, STMT_ORDER, STMT_MULTI)
+      
+      // Process Entries
+      const entries = ensureArray(newJson.Document.BkToCstmrStmt.Stmt.Ntry)
+      newJson.Document.BkToCstmrStmt.Stmt.Ntry = entries.map(entry => {
+        // Reorder Ntry
+        const reorderedEntry = reorderObject(entry, NTRY_ORDER)
         
         // Process TxDtls
-        if (newEntry.NtryDtls?.TxDtls) {
-          const txDtls = newEntry.NtryDtls.TxDtls
-          const newTxDtls = reorderObject(txDtls, TX_ORDER)
-          
-          // Add AmtDtls if missing
-          if (!newTxDtls.AmtDtls && newTxDtls.Amt) {
-            newTxDtls.AmtDtls = {
-              InstdAmt: {
-                '@Ccy': newTxDtls.Amt['@Ccy'],
-                '#text': newTxDtls.Amt['#text'] || newTxDtls.Amt
-              }
-            }
-          }
+        if (reorderedEntry.NtryDtls?.TxDtls) {
+          const tx = reorderedEntry.NtryDtls.TxDtls
           
           // Transform RltdPties
-          if (entry.RltdPties) {
-            newTxDtls.RltdPties = transformRltdPties(entry.RltdPties)
+          if (tx.RltdPties) {
+            tx.RltdPties = transformRltdPties(tx.RltdPties)
           }
           
-          // Add empty RltdAgts
-          if (!newTxDtls.RltdAgts) {
-            newTxDtls.RltdAgts = null
-          }
-          
-          // Add RmtInf
-          if (!newTxDtls.RmtInf) {
-            newTxDtls.RmtInf = {
-              Ustrd: [
-                entry.AddtlNtryInf || grpText,
-                grpText
-              ]
+          // Add missing RmtInf second Ustrd
+          if (tx.RmtInf) {
+            if (typeof tx.RmtInf.Ustrd === 'string') {
+              tx.RmtInf.Ustrd = [tx.RmtInf.Ustrd, grpText]
+            } else if (Array.isArray(tx.RmtInf.Ustrd) && tx.RmtInf.Ustrd.length === 1) {
+              tx.RmtInf.Ustrd.push(grpText)
             }
           }
           
-          newEntry.NtryDtls.TxDtls = newTxDtls
-        }
-        
-        // Add AmtDtls to entry level
-        if (!newEntry.AmtDtls && newEntry.Amt) {
-          newEntry.AmtDtls = {
-            InstdAmt: {
-              Amt: {
-                '@Ccy': newEntry.Amt['@Ccy'],
-                '#text': newEntry.Amt['#text'] || newEntry.Amt
-              }
-            }
+          // Add empty RltdAgts if missing
+          if (!tx.RltdAgts) {
+            tx.RltdAgts = null // Dies wird zu <RltdAgts/> 
           }
+          
+          // Reorder TxDtls
+          reorderedEntry.NtryDtls.TxDtls = reorderObject(tx, TX_ORDER)
         }
         
-        return newEntry
+        // Ensure AddtlNtryInf exists
+        if (!reorderedEntry.AddtlNtryInf) {
+          reorderedEntry.AddtlNtryInf = grpText
+        }
+        
+        return reorderedEntry
       })
     }
     
-    newDoc.Document.BkToCstmrStmt.Stmt = newStmt
+    // Fix amount attributes
+    newJson = fixAmountAttributes(newJson)
     
-    // Build XML manually
-    const xmlOutput = [
-      "<?xml version='1.0' encoding='UTF-8'?>",
-      buildElement('Document', newDoc.Document, 0)
-    ].join('\n')
+    const builder = new XMLBuilder({
+      ignoreAttributes: false,
+      attributeNamePrefix: '@_',
+      textNodeName: '#text',
+      format: true,
+      indentBy: '  ',
+      suppressEmptyNode: false,
+      suppressBooleanAttributes: false
+    })
+
+    const xmlOutput = builder.build(newJson)
+    const declaration = `<?xml version='1.0' encoding='UTF-8'?>\n`
     
     res.setHeader('Content-Type', 'application/xml')
-    res.status(200).send(xmlOutput)
+    res.status(200).send(declaration + xmlOutput)
 
-  } catch (err) {
-    console.error('Error in /api/convert:', err)
-    res.status(500).send('Server error: ' + err.message)
+  } catch (error) {
+    console.error('Conversion error:', error)
+    res.status(500).send('Conversion failed: ' + error.message)
   }
 }
