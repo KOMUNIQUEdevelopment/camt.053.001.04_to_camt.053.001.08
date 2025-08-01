@@ -1,6 +1,7 @@
 {
   "name": "camt-converter",
   "version": "1.0.0",
+  "description": "Convert camt.053.001.04 to camt.053.001.08",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -10,7 +11,7 @@
     "next": "15.4.5",
     "react": "18.2.0",
     "react-dom": "18.2.0",
-    "xmldom": "^0.8.9",
-    "xpath": "^0.0.32"
+    "xmldom": "0.7.6",
+    "xmlbuilder2": "^4.7.2"
   }
 }
