@@ -8,10 +8,10 @@ export const config = {
   api: { bodyParser: false }
 }
 
-// Namespaces und Sortier-Arrays, analog Python-Skript
-const OLD_NS = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.04'
-const NEW_NS = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.08'
-const XSI_NS = 'http://www.w3.org/2001/XMLSchema-instance'
+// Namespaces und Sortier-Arrays
+const OLD_NS     = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.04'
+const NEW_NS     = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.08'
+const XSI_NS     = 'http://www.w3.org/2001/XMLSchema-instance'
 const STMT_ORDER = ['Id','ElctrncSeqNb','CreDtTm','FrToDt','CpyDplctInd','Acct']
 const STMT_MULTI = ['Bal','Ntry']
 const NTRY_ORDER = ['NtryRef','Amt','CdtDbtInd','RvslInd','Sts','BookgDt','ValDt','AcctSvcrRef','BkTxCd','NtryDtls','AddtlNtryInf']
@@ -35,40 +35,41 @@ function reorderObject(obj, order, multi = []) {
 
 export default async function handler(req, res) {
   try {
+    // 1) Upload parsen
     const form = new formidable.IncomingForm()
     const { fields, files } = await new Promise((resolve, reject) => {
-      form.parse(req, (err, fields, files) => err ? reject(err) : resolve({ fields, files }))
+      form.parse(req, (err, fields, files) =>
+        err ? reject(err) : resolve({ fields, files })
+      )
     })
-
     const file = files.file
     if (!file) {
       res.status(400).send('No file uploaded')
       return
     }
-
     const path = file.filepath || file.path
     if (!fs.existsSync(path)) {
       res.status(400).send(`File not found: ${path}`)
       return
     }
 
+    // 2) XML lesen & in JSON parsen
     const xml = fs.readFileSync(path, 'utf8')
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
     const docJson = parser.parse(xml)
 
-    // Fallback für Gruppen-Infotext
+    // 3) Gruppentext für Fallback
     const grpText = ((docJson.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf) ?? '') || ''
 
-    // Statement lesen und neu sortieren
-    const stmtIn = docJson.Document.BkToCstmrStmt.Stmt
+    // 4) <Stmt> neu sortieren
+    const stmtIn  = docJson.Document.BkToCstmrStmt.Stmt
     const newStmt = reorderObject(stmtIn, STMT_ORDER, STMT_MULTI)
 
-    // Buchungen transformieren
+    // 5) Jede Buchung (<Ntry>) umwandeln
     const oldEntries = ensureArray(stmtIn.Ntry)
     newStmt.Ntry = oldEntries.map(oldN => {
       const n = {}
-
-      // Ntry-Felder in Reihenfolge
+      // 5a) Ntry-Felder in korrekter Reihenfolge
       NTRY_ORDER.forEach(tag => {
         if (tag === 'NtryDtls') {
           if (oldN.NtryDtls) n.NtryDtls = oldN.NtryDtls
@@ -79,37 +80,32 @@ export default async function handler(req, res) {
         }
       })
 
-      // TxDtls transformieren
+      // 5b) TxDtls transformieren & Fallbacks
       if (n.NtryDtls?.TxDtls) {
-        const txIn = n.NtryDtls.TxDtls
+        const txIn  = n.NtryDtls.TxDtls
         const newTx = reorderObject(txIn, TX_ORDER)
 
-        // Fallbacks für fehlende Unterelemente
+        // fallback <AmtDtls>
         if (!newTx.AmtDtls && txIn.Amt) {
           newTx.AmtDtls = {
             InstdAmt: { '#text': txIn.Amt['#text'], 'Ccy': txIn.Amt.Ccy }
           }
         }
+        // fallback <RmtInf>
         if (!newTx.RmtInf) {
           newTx.RmtInf = { Ustrd: n.AddtlNtryInf }
         }
-        if (!newTx.RltdPties && oldN.RltdPties) {
-          newTx.RltdPties = oldN.RltdPties
-        }
-        if (!newTx.RltdAgts && oldN.RltdAgts) {
-          newTx.RltdAgts = oldN.RltdAgts
-        }
-        if (!newTx.BkTxCd && oldN.BkTxCd) {
-          newTx.BkTxCd = oldN.BkTxCd
-        }
+        // Gegenpartei & Agenten
+        if (!newTx.RltdPties && oldN.RltdPties) newTx.RltdPties = oldN.RltdPties
+        if (!newTx.RltdAgts  && oldN.RltdAgts ) newTx.RltdAgts  = oldN.RltdAgts
+        if (!newTx.BkTxCd    && oldN.BkTxCd   ) newTx.BkTxCd    = oldN.BkTxCd
 
         n.NtryDtls.TxDtls = newTx
       }
-
       return n
     })
 
-    // Ergebnis-JSON für XML-Builder
+    // 6) Zusammenbauen des neuen XML-Baums als JSON
     const outJson = {
       Document: {
         '@xmlns': NEW_NS,
@@ -117,22 +113,32 @@ export default async function handler(req, res) {
         '@xsi:schemaLocation': `${NEW_NS} camt.053.001.08.xsd`,
         BkToCstmrStmt: {
           GrpHdr: docJson.Document.BkToCstmrStmt.GrpHdr,
-          Stmt: newStmt
+          Stmt:   newStmt
         }
       }
     }
 
+    // 7) XML bauen inkl. Deklaration
     const builder = new XMLBuilder({
-      ignoreAttributes: false,
-      attributeNamePrefix: ''
+      ignoreAttributes:          false,
+      attributeNamePrefix:       '',
+      // die Deklaration am Anfang:
+      declaration: {
+        include:  true,
+        encoding: 'UTF-8',
+        version:  '1.0'
+      },
+      // leere Tags nicht unterdrücken:
+      suppressEmptyNode: false
     })
     const outXml = builder.build(outJson)
 
+    // 8) Response
     res.setHeader('Content-Type', 'application/xml')
     res.status(200).send(outXml)
 
   } catch (err) {
-    console.error('Error in /api/convert:', err)
+    console.error('🔥 Error in /api/convert:', err)
     res.status(500).send('Server error')
   }
 }
