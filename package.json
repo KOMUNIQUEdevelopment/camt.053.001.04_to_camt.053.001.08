@@ -1,19 +1,17 @@
+// === FILE: package.json ===
 {
   "name": "camt-converter",
   "version": "1.0.0",
-  "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start"
   },
   "dependencies": {
-    "fast-xml-parser": "^4.0.10",
-    "formidable": "^2.0.1",
     "next": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "@xmldom/xmldom": "^0.9.8",
-    "xpath": "^0.0.32"
+    "xml2js": "^0.4.23",
+    "xmldom": "^0.7.5"
   }
 }
