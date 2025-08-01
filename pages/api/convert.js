@@ -1,117 +1,73 @@
-// pages/api/convert.js
-
 import formidable from 'formidable'
 import fs from 'fs'
 import { XMLParser, XMLBuilder } from 'fast-xml-parser'
 
 export const config = { api: { bodyParser: false } }
 
-// Namespaces und Sortier-Arrays
-const OLD_NS     = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.04'
-const NEW_NS     = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.08'
-const XSI_NS     = 'http://www.w3.org/2001/XMLSchema-instance'
-const STMT_ORDER = ['Id','ElctrncSeqNb','CreDtTm','FrToDt','CpyDplctInd','Acct']
-const STMT_MULTI = ['Bal','Ntry']
-const NTRY_ORDER = ['NtryRef','Amt','CdtDbtInd','RvslInd','Sts','BookgDt','ValDt','AcctSvcrRef','BkTxCd','NtryDtls','AddtlNtryInf']
-const TX_ORDER   = ['Refs','Amt','CdtDbtInd','AmtDtls','BkTxCd','RltdPties','RltdAgts','RmtInf']
-
-function ensureArray(v) {
-  if (Array.isArray(v)) return v
-  if (v != null) return [v]
-  return []
-}
-
-function reorderObject(obj, order, multi = []) {
-  const out = {}
-  order.forEach(k => { if (obj[k] !== undefined) out[k] = obj[k] })
-  multi.forEach(k => { if (obj[k] !== undefined) out[k] = obj[k] })
-  Object.keys(obj)
-    .filter(k => !order.includes(k) && !multi.includes(k))
-    .forEach(k => { out[k] = obj[k] })
-  return out
-}
-
 export default async function handler(req, res) {
-  try {
-    const form = new formidable.IncomingForm()
-    const { files } = await new Promise((resolve, reject) => {
-      form.parse(req, (err, fields, files) =>
-        err ? reject(err) : resolve({ fields, files })
-      )
-    })
-    const file = files.file
-    if (!file) {
-      return res.status(400).send('No file uploaded')
-    }
-    const path = file.filepath || file.path
-    if (!fs.existsSync(path)) {
-      return res.status(400).send(`File not found: ${path}`)
-    }
+  const form = new formidable.IncomingForm()
 
-    const xml = fs.readFileSync(path, 'utf8')
-    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
-    const docJson = parser.parse(xml)
+  const { files } = await new Promise((resolve, reject) => {
+    form.parse(req, (err, fields, files) =>
+      err ? reject(err) : resolve({ fields, files })
+    )
+  })
 
-    const grpText = docJson.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || ''
-    const stmtIn  = docJson.Document.BkToCstmrStmt.Stmt
-    const newStmt = reorderObject(stmtIn, STMT_ORDER, STMT_MULTI)
+  const xml = fs.readFileSync(files.file.filepath, 'utf8')
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '',
+    preserveOrder: false
+  })
 
-    const oldEntries = ensureArray(stmtIn.Ntry)
-    newStmt.Ntry = oldEntries.map(oldN => {
-      const n = {}
-      NTRY_ORDER.forEach(tag => {
-        if (tag === 'NtryDtls') {
-          if (oldN.NtryDtls) n.NtryDtls = oldN.NtryDtls
-        } else if (tag === 'AddtlNtryInf') {
-          n.AddtlNtryInf = oldN.AddtlNtryInf || grpText
-        } else if (oldN[tag] !== undefined) {
-          n[tag] = oldN[tag]
+  let json = parser.parse(xml)
+
+  // 🔧 Fix: konvertiere bestimmte Attribute zu Child-Elementen
+  const fixTxDtls = (jsonNode) => {
+    if (!jsonNode?.BkToCstmrStmt?.Stmt?.Ntry) return
+
+    const entries = Array.isArray(jsonNode.BkToCstmrStmt.Stmt.Ntry)
+      ? jsonNode.BkToCstmrStmt.Stmt.Ntry
+      : [jsonNode.BkToCstmrStmt.Stmt.Ntry]
+
+    entries.forEach(entry => {
+      if (!entry.NtryDtls?.TxDtls) return
+
+      const txList = Array.isArray(entry.NtryDtls.TxDtls)
+        ? entry.NtryDtls.TxDtls
+        : [entry.NtryDtls.TxDtls]
+
+      txList.forEach(tx => {
+        // Verschiebe CdtDbtInd aus Attribut zu Element
+        if (tx.CdtDbtInd) return // schon als Element vorhanden
+        if (tx.CdtDbtInd === undefined && tx['CdtDbtInd']) {
+          tx.CdtDbtInd = tx['CdtDbtInd']
+          delete tx['CdtDbtInd']
+        }
+        if (tx.CdtDbtInd === undefined && tx.CdtDbtIndAttr) {
+          tx.CdtDbtInd = tx.CdtDbtIndAttr
+          delete tx.CdtDbtIndAttr
+        }
+
+        // Falls AcctSvcrRef als Attribut in Refs ist, konvertiere zu Child-Element
+        if (tx.Refs && tx.Refs.AcctSvcrRef && typeof tx.Refs.AcctSvcrRef === 'string') {
+          tx.Refs = {
+            AcctSvcrRef: tx.Refs.AcctSvcrRef
+          }
         }
       })
-      if (n.NtryDtls?.TxDtls) {
-        const txIn  = n.NtryDtls.TxDtls
-        const newTx = reorderObject(txIn, TX_ORDER)
-        if (!newTx.AmtDtls && txIn.Amt) {
-          newTx.AmtDtls = { InstdAmt: { '#text': txIn.Amt['#text'], Ccy: txIn.Amt.Ccy } }
-        }
-        if (!newTx.RmtInf) {
-          newTx.RmtInf = { Ustrd: n.AddtlNtryInf }
-        }
-        if (!newTx.RltdPties && oldN.RltdPties)   newTx.RltdPties = oldN.RltdPties
-        if (!newTx.RltdAgts  && oldN.RltdAgts )   newTx.RltdAgts  = oldN.RltdAgts
-        if (!newTx.BkTxCd    && oldN.BkTxCd   )   newTx.BkTxCd    = oldN.BkTxCd
-        n.NtryDtls.TxDtls = newTx
-      }
-      return n
     })
-
-    const outJson = {
-      Document: {
-        xmlns:              NEW_NS,
-        'xmlns:xsi':        XSI_NS,
-        'xsi:schemaLocation': `${NEW_NS} camt.053.001.08.xsd`,
-        BkToCstmrStmt: {
-          GrpHdr: docJson.Document.BkToCstmrStmt.GrpHdr,
-          Stmt:   newStmt
-        }
-      }
-    }
-
-    const builder = new XMLBuilder({
-      ignoreAttributes:    false,
-      attributeNamePrefix: '',
-      format:              true,
-      indentBy:            '  ',
-      suppressEmptyNode:   false
-    })
-    const xmlBody = builder.build(outJson)
-
-    const declaration = "<?xml version='1.0' encoding='UTF-8'?>\n\n"
-
-    res.setHeader('Content-Type', 'application/xml')
-    res.status(200).send(declaration + xmlBody + "\n")
-  } catch (err) {
-    console.error('Error in /api/convert:', err)
-    res.status(500).send('Server error')
   }
+
+  fixTxDtls(json)
+
+  const builder = new XMLBuilder({
+    ignoreAttributes: false,
+    attributeNamePrefix: '',
+    format: true
+  })
+  const outputXml = builder.build(json)
+
+  res.setHeader('Content-Type', 'application/xml')
+  res.status(200).send(outputXml)
 }
