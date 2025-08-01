@@ -19,24 +19,35 @@ function ensureArray(value) {
   return []
 }
 
+function copyWithNewNamespace(obj) {
+  if (obj === null || typeof obj !== 'object') return obj
+  if (Array.isArray(obj)) return obj.map(copyWithNewNamespace)
+  
+  const result = {}
+  Object.keys(obj).forEach(key => {
+    result[key] = copyWithNewNamespace(obj[key])
+  })
+  return result
+}
+
 function reorderObject(obj, order, multi = []) {
   const result = {}
   
-  // Erst die geordneten Felder
+  // Erst die Reihenfolge-Elemente
   order.forEach(key => {
     if (obj[key] !== undefined) {
       result[key] = obj[key]
     }
   })
   
-  // Dann die Multi-Felder
+  // Dann die Multi-Elemente
   multi.forEach(key => {
     if (obj[key] !== undefined) {
       result[key] = obj[key]
     }
   })
   
-  // Alle anderen Felder
+  // Dann alle anderen
   Object.keys(obj).forEach(key => {
     if (!order.includes(key) && !multi.includes(key)) {
       result[key] = obj[key]
@@ -69,31 +80,32 @@ export default async function handler(req, res) {
       preserveOrder: false
     })
 
-    const jsonObj = parser.parse(xml)
+    const parsed = parser.parse(xml)
     
-    // GrpHdr AddtlInf als Standard-Beschreibung
-    const grpText = jsonObj?.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || ''
+    // Extrahiere GrpHdr AddtlInf für Beschreibung
+    const grpText = parsed?.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || 'SPS/1.7.1/PROD'
     
-    // Namespace aktualisieren
-    jsonObj.Document['@xmlns'] = NEW_NS
-    jsonObj.Document['@xmlns:xsi'] = XSI_NS
-    jsonObj.Document['@xsi:schemaLocation'] = `${NEW_NS} camt.053.001.08.xsd`
+    // Kopiere Struktur
+    const copied = copyWithNewNamespace(parsed)
+    const stmt = copied.Document.BkToCstmrStmt.Stmt
     
-    // Stmt reorganisieren
-    const stmt = jsonObj.Document.BkToCstmrStmt.Stmt
-    const reorderedStmt = reorderObject(stmt, STMT_ORDER, STMT_MULTI)
+    // Reorder Stmt
+    copied.Document.BkToCstmrStmt.Stmt = reorderObject(stmt, STMT_ORDER, STMT_MULTI)
     
-    // Ntry-Einträge verarbeiten
-    const entries = ensureArray(reorderedStmt.Ntry)
-    reorderedStmt.Ntry = entries.map(entry => {
+    // Process Entries
+    const entries = ensureArray(copied.Document.BkToCstmrStmt.Stmt.Ntry)
+    copied.Document.BkToCstmrStmt.Stmt.Ntry = entries.map(entry => {
+      // Reorder Entry
       const reorderedEntry = reorderObject(entry, NTRY_ORDER)
       
-      // TxDtls verarbeiten
+      // Process TxDtls
       if (reorderedEntry.NtryDtls?.TxDtls) {
-        const txDtls = reorderedEntry.NtryDtls.TxDtls
-        const reorderedTx = reorderObject(txDtls, TX_ORDER)
+        const tx = reorderedEntry.NtryDtls.TxDtls
         
-        // AmtDtls hinzufügen falls fehlt
+        // Reorder TxDtls
+        const reorderedTx = reorderObject(tx, TX_ORDER)
+        
+        // Add missing AmtDtls in TxDtls
         if (!reorderedTx.AmtDtls && reorderedTx.Amt) {
           reorderedTx.AmtDtls = {
             InstdAmt: {
@@ -103,52 +115,62 @@ export default async function handler(req, res) {
           }
         }
         
-        // RltdPties korrigieren
+        // Fix RmtInf - add second Ustrd
+        if (reorderedTx.RmtInf) {
+          const existingUstrd = reorderedTx.RmtInf.Ustrd
+          reorderedTx.RmtInf.Ustrd = [
+            existingUstrd,
+            grpText
+          ]
+        } else {
+          reorderedTx.RmtInf = {
+            Ustrd: [grpText, grpText]
+          }
+        }
+        
+        // Fix RltdPties structure
         if (reorderedTx.RltdPties) {
-          const rltdPties = reorderedTx.RltdPties
+          const parties = reorderedTx.RltdPties
           
-          // DbtrAcct zu CdtrAcct umbenennen
-          if (rltdPties.DbtrAcct) {
-            rltdPties.CdtrAcct = rltdPties.DbtrAcct
-            delete rltdPties.DbtrAcct
+          // Transform DbtrAcct -> CdtrAcct if needed
+          if (parties.DbtrAcct) {
+            parties.CdtrAcct = parties.DbtrAcct
+            delete parties.DbtrAcct
           }
           
-          // Cdtr mit Pty wrapper
-          if (rltdPties.Cdtr && !rltdPties.Cdtr.Pty) {
-            const cdtrContent = { ...rltdPties.Cdtr }
-            rltdPties.Cdtr = { Pty: cdtrContent }
+          // Wrap Cdtr content in Pty if needed
+          if (parties.Cdtr && !parties.Cdtr.Pty) {
+            const cdtrContent = { ...parties.Cdtr }
+            parties.Cdtr = { Pty: cdtrContent }
           }
         }
         
-        // RmtInf korrigieren
-        if (!reorderedTx.RmtInf) {
-          reorderedTx.RmtInf = { Ustrd: [grpText] }
-        } else if (reorderedTx.RmtInf.Ustrd) {
-          const ustrdArray = ensureArray(reorderedTx.RmtInf.Ustrd)
-          if (!ustrdArray.includes(grpText)) {
-            ustrdArray.push(grpText)
-          }
-          reorderedTx.RmtInf.Ustrd = ustrdArray
-        }
-        
-        // RltdAgts hinzufügen falls fehlt
+        // Add empty RltdAgts
         if (!reorderedTx.RltdAgts) {
-          reorderedTx.RltdAgts = null
+          reorderedTx.RltdAgts = {}
         }
         
         reorderedEntry.NtryDtls.TxDtls = reorderedTx
       }
       
-      // AddtlNtryInf hinzufügen falls fehlt
+      // Add AddtlNtryInf if missing
       if (!reorderedEntry.AddtlNtryInf) {
         reorderedEntry.AddtlNtryInf = grpText
       }
       
       return reorderedEntry
     })
-    
-    jsonObj.Document.BkToCstmrStmt.Stmt = reorderedStmt
-    
+
+    // Baue finales Dokument
+    const outputDoc = {
+      Document: {
+        '@xmlns': NEW_NS,
+        '@xmlns:xsi': XSI_NS,
+        '@xsi:schemaLocation': `${NEW_NS} camt.053.001.08.xsd`,
+        BkToCstmrStmt: copied.Document.BkToCstmrStmt
+      }
+    }
+
     const builder = new XMLBuilder({
       ignoreAttributes: false,
       attributeNamePrefix: '@',
@@ -158,13 +180,13 @@ export default async function handler(req, res) {
       suppressEmptyNode: false
     })
 
-    const xmlOutput = builder.build(jsonObj)
+    const xmlOutput = builder.build(outputDoc)
     
-    // Nur EINE XML-Deklaration
+    // **NUR eine XML-Deklaration hinzufügen**
     const finalXml = `<?xml version='1.0' encoding='UTF-8'?>\n${xmlOutput}`
 
     res.setHeader('Content-Type', 'application/xml')
-    res.setHeader('Content-Disposition', 'attachment; filename="converted.xml"')
+    res.setHeader('Content-Disposition', 'attachment; filename="converted_camt.xml"')
     res.status(200).send(finalXml)
 
   } catch (error) {
