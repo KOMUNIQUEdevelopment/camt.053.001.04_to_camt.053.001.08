@@ -1,6 +1,6 @@
 import formidable from 'formidable'
 import fs from 'fs'
-import { XMLParser } from 'fast-xml-parser'
+import { XMLParser, XMLBuilder } from 'fast-xml-parser'
 
 export const config = { api: { bodyParser: false } }
 
@@ -8,102 +8,128 @@ const OLD_NS = "urn:iso:std:iso:20022:tech:xsd:camt.053.001.04"
 const NEW_NS = "urn:iso:std:iso:20022:tech:xsd:camt.053.001.08"
 const XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
 
+const STMT_ORDER = ['Id', 'ElctrncSeqNb', 'CreDtTm', 'FrToDt', 'CpyDplctInd', 'Acct']
+const STMT_MULTI = ['Bal', 'Ntry']
+const NTRY_ORDER = ['NtryRef', 'Amt', 'CdtDbtInd', 'RvslInd', 'Sts', 'BookgDt', 'ValDt', 'AcctSvcrRef', 'BkTxCd', 'NtryDtls', 'AddtlNtryInf']
+const TX_ORDER = ['Refs', 'Amt', 'CdtDbtInd', 'AmtDtls', 'BkTxCd', 'RltdPties', 'RltdAgts', 'RmtInf']
+
 function ensureArray(value) {
   if (Array.isArray(value)) return value
   if (value != null) return [value]
   return []
 }
 
-function buildXmlElement(name, content, attributes = {}) {
-  let attrStr = ''
-  for (const [key, value] of Object.entries(attributes)) {
-    if (value !== undefined && value !== null) {
-      attrStr += ` ${key}="${value}"`
-    }
-  }
-  
-  if (content === null || content === undefined || content === '') {
-    return `<${name}${attrStr}/>`
-  }
-  
-  if (typeof content === 'string' || typeof content === 'number') {
-    return `<${name}${attrStr}>${content}</${name}>`
-  }
-  
-  return `<${name}${attrStr}>\n${content}\n</${name}>`
-}
+function copyWithNewNamespace(obj, visited = new Set()) {
+  if (obj === null || typeof obj !== 'object') return obj
+  if (visited.has(obj)) return obj
+  visited.add(obj)
 
-function copyElement(element, indent = '  ') {
-  if (typeof element === 'string' || typeof element === 'number') {
-    return element.toString()
+  if (Array.isArray(obj)) {
+    return obj.map(item => copyWithNewNamespace(item, visited))
   }
-  
-  if (typeof element !== 'object' || element === null) {
-    return ''
-  }
-  
-  let result = ''
-  
-  for (const [key, value] of Object.entries(element)) {
-    if (key.startsWith('@') || key === '#text') continue
-    
-    const cleanKey = key.replace(/^.*:/, '') // Remove namespace prefix
-    
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        const attrs = item && typeof item === 'object' ? extractAttributes(item) : {}
-        const content = getElementContent(item)
-        result += `${indent}${buildXmlElement(cleanKey, content, attrs)}\n`
-      }
-    } else {
-      const attrs = value && typeof value === 'object' ? extractAttributes(value) : {}
-      const content = getElementContent(value)
-      result += `${indent}${buildXmlElement(cleanKey, content, attrs)}\n`
-    }
-  }
-  
-  return result.trimEnd()
-}
 
-function extractAttributes(obj) {
-  if (!obj || typeof obj !== 'object') return {}
-  
-  const attrs = {}
+  const result = {}
   for (const [key, value] of Object.entries(obj)) {
-    if (key.startsWith('@')) {
-      attrs[key.substring(1)] = value
-    } else if (key === 'Ccy' && typeof value === 'string') {
-      attrs.Ccy = value
-    }
+    result[key] = copyWithNewNamespace(value, visited)
   }
-  return attrs
+  return result
 }
 
-function getElementContent(obj) {
-  if (typeof obj === 'string' || typeof obj === 'number') {
-    return obj
+function reorderObject(obj, order, multi = []) {
+  const result = {}
+
+  order.forEach(key => {
+    if (obj[key] !== undefined) {
+      result[key] = obj[key]
+    }
+  })
+
+  multi.forEach(key => {
+    if (obj[key] !== undefined) {
+      result[key] = obj[key]
+    }
+  })
+
+  Object.keys(obj).forEach(key => {
+    if (!order.includes(key) && !multi.includes(key)) {
+      result[key] = obj[key]
+    }
+  })
+
+  return result
+}
+
+function normalizeRltdPties(tx, oldNtry) {
+  delete tx.RltdPties
+
+  const oldRltdPties = oldNtry.RltdPties
+  if (!oldRltdPties) return
+
+  const newRltdPties = copyWithNewNamespace(oldRltdPties)
+
+  if (newRltdPties.DbtrAcct) {
+    newRltdPties.CdtrAcct = newRltdPties.DbtrAcct
+    delete newRltdPties.DbtrAcct
   }
-  
-  if (!obj || typeof obj !== 'object') return ''
-  
-  if (obj['#text']) {
-    return obj['#text']
+
+  if (newRltdPties.Dbtr) {
+    newRltdPties.Cdtr = newRltdPties.Dbtr
+    delete newRltdPties.Dbtr
   }
-  
-  // Handle Amt elements specially
-  if (obj.Ccy && obj['#text']) {
-    return obj['#text']
+
+  if (newRltdPties.Cdtr && !newRltdPties.Cdtr.Pty) {
+    const cdtrContent = { ...newRltdPties.Cdtr }
+    newRltdPties.Cdtr = { Pty: cdtrContent }
   }
-  
-  // For complex objects, build nested content
-  const content = copyElement(obj, '    ')
-  return content ? `\n  ${content}\n` : null
+
+  const pstlAdr = newRltdPties.Cdtr?.Pty?.PstlAdr
+  if (pstlAdr && pstlAdr.AdrLine) {
+    const adrLines = ensureArray(pstlAdr.AdrLine)
+    if (adrLines.length > 0 && !pstlAdr.StrtNm) {
+      pstlAdr.StrtNm = adrLines[0]
+    }
+    delete pstlAdr.AdrLine
+  }
+
+  const orderedRltdPties = {}
+  if (newRltdPties.Cdtr) orderedRltdPties.Cdtr = newRltdPties.Cdtr
+  if (newRltdPties.CdtrAcct) orderedRltdPties.CdtrAcct = newRltdPties.CdtrAcct
+
+  tx.RltdPties = orderedRltdPties
+}
+
+function copyRmtInf(tx, oldNtry, grpText) {
+  if (!tx.RmtInf) tx.RmtInf = {}
+
+  const ustrdArray = []
+
+  const oldRmtInf = oldNtry.NtryDtls?.TxDtls?.RmtInf || oldNtry.RmtInf
+  if (oldRmtInf) {
+    const oldUstrd = ensureArray(oldRmtInf.Ustrd)
+    ustrdArray.push(...oldUstrd)
+
+    if (oldRmtInf.Strd) {
+      const strdArray = ensureArray(oldRmtInf.Strd)
+      strdArray.forEach(strd => {
+        if (strd.AddtlRmtInf) {
+          const addtlArray = ensureArray(strd.AddtlRmtInf)
+          ustrdArray.push(...addtlArray)
+        }
+      })
+    }
+  }
+
+  if (grpText) {
+    ustrdArray.push(grpText)
+  }
+
+  tx.RmtInf.Ustrd = ustrdArray.length > 1 ? ustrdArray : ustrdArray[0] || grpText
 }
 
 export default async function handler(req, res) {
   try {
     const form = new formidable.IncomingForm()
-    
+
     const { files } = await new Promise((resolve, reject) => {
       form.parse(req, (err, fields, files) =>
         err ? reject(err) : resolve({ fields, files })
@@ -115,158 +141,107 @@ export default async function handler(req, res) {
     }
 
     const xml = fs.readFileSync(files.file.filepath, 'utf8')
-    
+
     const parser = new XMLParser({
+      ignoreAttributes: false,
+      attributeNamePrefix: '',
+      textNodeName: '#text',
+      preserveOrder: false
+    })
+
+    const srcDoc = parser.parse(xml)
+
+    const grpText = srcDoc.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || ''
+
+    const oldStmt = srcDoc.Document?.BkToCstmrStmt
+    if (!oldStmt) {
+      return res.status(400).send('No BkToCstmrStmt found')
+    }
+
+    const newDoc = {
+      Document: {
+        '@xmlns': NEW_NS,
+        '@xmlns:xsi': XSI_NS,
+        '@xsi:schemaLocation': `${NEW_NS} camt.053.001.08.xsd`,
+        BkToCstmrStmt: {
+          GrpHdr: copyWithNewNamespace(oldStmt.GrpHdr),
+          Stmt: copyWithNewNamespace(oldStmt.Stmt)
+        }
+      }
+    }
+
+    const newStmt = newDoc.Document.BkToCstmrStmt.Stmt
+    newDoc.Document.BkToCstmrStmt.Stmt = reorderObject(newStmt, STMT_ORDER, STMT_MULTI)
+
+    const oldEntries = ensureArray(oldStmt.Stmt.Ntry)
+    const newEntries = ensureArray(newDoc.Document.BkToCstmrStmt.Stmt.Ntry)
+
+    for (let i = 0; i < oldEntries.length && i < newEntries.length; i++) {
+      const oldNtry = oldEntries[i]
+      const newNtry = newEntries[i]
+
+      newEntries[i] = reorderObject(newNtry, NTRY_ORDER)
+
+      const tx = newEntries[i].NtryDtls?.TxDtls
+      if (tx) {
+        newEntries[i].NtryDtls.TxDtls = reorderObject(tx, TX_ORDER)
+        const sortedTx = newEntries[i].NtryDtls.TxDtls
+
+        // 🔧 FIXED: Safely extract Amt and Ccy values
+        const rawAmt = sortedTx.Amt
+        let amtValue = ''
+        let amtCcy = 'CHF'
+
+        if (typeof rawAmt === 'object') {
+          amtValue = rawAmt['#text'] || ''
+          amtCcy = rawAmt.Ccy || rawAmt['@Ccy'] || amtCcy
+        } else {
+          amtValue = rawAmt
+        }
+
+        sortedTx.Amt = {
+          '@Ccy': amtCcy,
+          '#text': amtValue
+        }
+
+        sortedTx.AmtDtls = {
+          InstdAmt: {
+            '@Ccy': amtCcy,
+            '#text': amtValue
+          }
+        }
+
+        normalizeRltdPties(sortedTx, oldNtry)
+
+        if (!sortedTx.RltdAgts) {
+          sortedTx.RltdAgts = oldNtry.RltdAgts ? copyWithNewNamespace(oldNtry.RltdAgts) : {}
+        }
+
+        copyRmtInf(sortedTx, oldNtry, grpText)
+      }
+
+      if (!newEntries[i].AddtlNtryInf) {
+        newEntries[i].AddtlNtryInf = grpText
+      }
+    }
+
+    newDoc.Document.BkToCstmrStmt.Stmt.Ntry = newEntries
+
+    const builder = new XMLBuilder({
       ignoreAttributes: false,
       attributeNamePrefix: '@',
       textNodeName: '#text',
-      parseAttributeValue: false,
-      parseTagValue: false,
-      trimValues: false
+      format: true,
+      indentBy: '  ',
+      suppressEmptyNode: false
     })
 
-    const parsed = parser.parse(xml)
-    const document = parsed.Document
-    
-    if (!document) {
-      return res.status(400).send('Invalid CAMT document')
-    }
-
-    // Get default description from GrpHdr
-    const grpText = document.BkToCstmrStmt?.GrpHdr?.AddtlInf || ''
-    
-    // Start building the output XML manually
-    let output = `<?xml version='1.0' encoding='UTF-8'?>\n`
-    output += `<Document xmlns="${NEW_NS}" xmlns:xsi="${XSI_NS}" xsi:schemaLocation="${NEW_NS} camt.053.001.08.xsd">\n`
-    
-    // Copy BkToCstmrStmt
-    output += `  <BkToCstmrStmt>\n`
-    
-    // Copy GrpHdr exactly
-    const grpHdr = document.BkToCstmrStmt.GrpHdr
-    output += `    <GrpHdr>\n`
-    output += copyElement(grpHdr, '      ')
-    output += `\n    </GrpHdr>\n`
-    
-    // Process Stmt
-    const stmt = document.BkToCstmrStmt.Stmt
-    output += `    <Stmt>\n`
-    
-    // Add Stmt elements in correct order
-    const stmtOrder = ['Id','ElctrncSeqNb','CreDtTm','FrToDt','CpyDplctInd','Acct']
-    for (const key of stmtOrder) {
-      if (stmt[key]) {
-        const attrs = extractAttributes(stmt[key])
-        const content = getElementContent(stmt[key])
-        output += `      ${buildXmlElement(key, content, attrs)}\n`
-      }
-    }
-    
-    // Add Bal elements
-    const balances = ensureArray(stmt.Bal)
-    for (const bal of balances) {
-      output += `      <Bal>\n`
-      output += copyElement(bal, '        ')
-      output += `\n      </Bal>\n`
-    }
-    
-    // Process Ntry elements
-    const entries = ensureArray(stmt.Ntry)
-    for (const entry of entries) {
-      output += `      <Ntry>\n`
-      
-      // Add Ntry elements in correct order
-      const ntryOrder = ['NtryRef','Amt','CdtDbtInd','RvslInd','Sts','BookgDt','ValDt','AcctSvcrRef','BkTxCd','NtryDtls','AddtlNtryInf']
-      
-      for (const key of ntryOrder) {
-        if (entry[key]) {
-          if (key === 'Amt') {
-            const ccy = entry[key].Ccy || entry[key]['@Ccy']
-            const amount = entry[key]['#text'] || entry[key]
-            output += `        <Amt Ccy="${ccy}">${amount}</Amt>\n`
-          } else if (key === 'NtryDtls') {
-            output += `        <NtryDtls>\n`
-            const txDtls = entry[key].TxDtls
-            if (txDtls) {
-              output += `          <TxDtls>\n`
-              
-              // Process TxDtls in correct order
-              const txOrder = ['Refs','Amt','CdtDbtInd','AmtDtls','BkTxCd','RltdPties','RltdAgts','RmtInf']
-              
-              for (const txKey of txOrder) {
-                if (txDtls[txKey]) {
-                  if (txKey === 'Amt') {
-                    const ccy = txDtls[txKey].Ccy || txDtls[txKey]['@Ccy']
-                    const amount = txDtls[txKey]['#text'] || txDtls[txKey]
-                    output += `            <Amt Ccy="${ccy}">${amount}</Amt>\n`
-                  } else if (txKey === 'AmtDtls') {
-                    output += `            <AmtDtls>\n`
-                    const instdAmt = txDtls[txKey].InstdAmt
-                    if (instdAmt) {
-                      const ccy = instdAmt.Ccy || instdAmt['@Ccy']
-                      const amount = instdAmt['#text'] || instdAmt
-                      output += `              <InstdAmt Ccy="${ccy}">${amount}</InstdAmt>\n`
-                    }
-                    output += `            </AmtDtls>\n`
-                  } else if (txKey === 'RltdAgts') {
-                    output += `            <RltdAgts/>\n`
-                  } else {
-                    output += `            ${buildXmlElement(txKey, copyElement(txDtls[txKey], '              '))}\n`
-                  }
-                }
-              }
-              
-              // Add missing AmtDtls if not present
-              if (!txDtls.AmtDtls && txDtls.Amt) {
-                const ccy = txDtls.Amt.Ccy || txDtls.Amt['@Ccy']
-                const amount = txDtls.Amt['#text'] || txDtls.Amt
-                output += `            <AmtDtls>\n`
-                output += `              <InstdAmt Ccy="${ccy}">${amount}</InstdAmt>\n`
-                output += `            </AmtDtls>\n`
-              }
-              
-              // Add missing RltdAgts if not present
-              if (!txDtls.RltdAgts) {
-                output += `            <RltdAgts/>\n`
-              }
-              
-              output += `          </TxDtls>\n`
-            }
-            output += `        </NtryDtls>\n`
-          } else {
-            const attrs = extractAttributes(entry[key])
-            const content = getElementContent(entry[key])
-            output += `        ${buildXmlElement(key, content, attrs)}\n`
-          }
-        }
-      }
-      
-      // Add missing AmtDtls at Ntry level
-      if (!entry.AmtDtls && entry.Amt) {
-        output += `        <AmtDtls>\n`
-        output += `          <InstdAmt>\n`
-        const ccy = entry.Amt.Ccy || entry.Amt['@Ccy']
-        const amount = entry.Amt['#text'] || entry.Amt
-        output += `            <Amt Ccy="${ccy}">${amount}</Amt>\n`
-        output += `          </InstdAmt>\n`
-        output += `        </AmtDtls>\n`
-      }
-      
-      // Add missing AddtlNtryInf
-      if (!entry.AddtlNtryInf) {
-        output += `        <AddtlNtryInf>${grpText}</AddtlNtryInf>\n`
-      }
-      
-      output += `      </Ntry>\n`
-    }
-    
-    output += `    </Stmt>\n`
-    output += `  </BkToCstmrStmt>\n`
-    output += `</Document>\n`
+    const xmlOutput = builder.build(newDoc)
+    const declaration = "<?xml version='1.0' encoding='UTF-8'?>\n"
 
     res.setHeader('Content-Type', 'application/xml')
-    res.setHeader('Content-Disposition', 'attachment; filename="converted.xml"')
-    res.status(200).send(output)
+    res.setHeader('Content-Disposition', 'attachment; filename="converted_camt_08.xml"')
+    res.status(200).send(declaration + xmlOutput)
 
   } catch (error) {
     console.error('Conversion error:', error)
