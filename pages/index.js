@@ -1,45 +1,34 @@
-import { useState } from 'react';
+import { useState } from 'react'
 
 export default function Home() {
-  const [file, setFile] = useState(null);
-  const [convertedFile, setConvertedFile] = useState(null);
+  const [file, setFile] = useState(null)
+  const [downloadUrl, setDownloadUrl] = useState('')
 
-  const handleFileChange = (e) => {
-    setFile(e.target.files[0]);
-  };
-
-  const handleConvert = async () => {
-    const formData = new FormData();
-    formData.append('file', file);
-
-    const res = await fetch('/api/convert', {
-      method: 'POST',
-      body: formData
-    });
-
-    if (res.ok) {
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      setConvertedFile(url);
-    } else {
-      alert('Fehler bei der Konvertierung');
-    }
-  };
+  const handleUpload = async e => {
+    e.preventDefault()
+    if (!file) return
+    const formData = new FormData()
+    formData.append('file', file)
+    const res = await fetch('/api/convert', { method: 'POST', body: formData })
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    setDownloadUrl(url)
+  }
 
   return (
     <div style={{ padding: '2rem' }}>
-      <h1>camt.053.001.04 → .08 Converter</h1>
-      <input type="file" accept=".xml" onChange={handleFileChange} />
-      <button onClick={handleConvert} disabled={!file}>
-        Konvertieren
-      </button>
-      {convertedFile && (
+      <h1>CAMT Converter</h1>
+      <form onSubmit={handleUpload}>
+        <input type="file" accept=".xml" onChange={e => setFile(e.target.files[0])} />
+        <button type="submit">Convert</button>
+      </form>
+      {downloadUrl && (
         <p>
-          <a href={convertedFile} download="converted.xml">
-            Download converted file
+          <a href={downloadUrl} download="converted.xml">
+            Download converted CAMT file
           </a>
         </p>
       )}
     </div>
-  );
+  )
 }
