@@ -1,3 +1,5 @@
+// pages/api/convert.js
+
 import formidable from 'formidable'
 import fs from 'fs'
 import { XMLParser, XMLBuilder } from 'fast-xml-parser'
@@ -38,9 +40,13 @@ export default async function handler(req, res) {
       )
     })
     const file = files.file
-    if (!file) return res.status(400).send('No file uploaded')
+    if (!file) {
+      return res.status(400).send('No file uploaded')
+    }
     const path = file.filepath || file.path
-    if (!fs.existsSync(path)) return res.status(400).send(`File not found: ${path}`)
+    if (!fs.existsSync(path)) {
+      return res.status(400).send(`File not found: ${path}`)
+    }
 
     const xml = fs.readFileSync(path, 'utf8')
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
@@ -71,9 +77,9 @@ export default async function handler(req, res) {
         if (!newTx.RmtInf) {
           newTx.RmtInf = { Ustrd: n.AddtlNtryInf }
         }
-        if (!newTx.RltdPties && oldN.RltdPties) newTx.RltdPties = oldN.RltdPties
-        if (!newTx.RltdAgts  && oldN.RltdAgts ) newTx.RltdAgts  = oldN.RltdAgts
-        if (!newTx.BkTxCd    && oldN.BkTxCd   ) newTx.BkTxCd    = oldN.BkTxCd
+        if (!newTx.RltdPties && oldN.RltdPties)   newTx.RltdPties = oldN.RltdPties
+        if (!newTx.RltdAgts  && oldN.RltdAgts )   newTx.RltdAgts  = oldN.RltdAgts
+        if (!newTx.BkTxCd    && oldN.BkTxCd   )   newTx.BkTxCd    = oldN.BkTxCd
         n.NtryDtls.TxDtls = newTx
       }
       return n
@@ -93,21 +99,17 @@ export default async function handler(req, res) {
 
     const builder = new XMLBuilder({
       ignoreAttributes:    false,
-      attributeNamePrefix: '@',  // Prefix für Attribute
-      textNodeName: '#text',
+      attributeNamePrefix: '',
       format:              true,
       indentBy:            '  ',
       suppressEmptyNode:   false
     })
     const xmlBody = builder.build(outJson)
-    const xmlBody = builder.build(outJson)
-    const declaration = "<?xml version='1.0' encoding='UTF-8'?>
 
-"
+    const declaration = "<?xml version='1.0' encoding='UTF-8'?>\n\n"
+
     res.setHeader('Content-Type', 'application/xml')
-    res.status(200).send(declaration + xmlBody + '
-')
-
+    res.status(200).send(declaration + xmlBody + "\n")
   } catch (err) {
     console.error('Error in /api/convert:', err)
     res.status(500).send('Server error')
