@@ -1,4 +1,4 @@
-import formidable from 'formidable-serverless'
+import formidable from 'formidable'
 import fs from 'fs'
 import { XMLParser, XMLBuilder } from 'fast-xml-parser'
 
