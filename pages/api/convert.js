@@ -1,10 +1,36 @@
+// pages/api/convert.js
+
 import formidable from 'formidable'
 import fs from 'fs'
+import { XMLParser, XMLBuilder } from 'fast-xml-parser'
 
 export const config = {
-  api: {
-    bodyParser: false
-  }
+  api: { bodyParser: false }
+}
+
+// Namespaces und Sortier-Arrays, analog Python-Skript
+const OLD_NS = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.04'
+const NEW_NS = 'urn:iso:std:iso:20022:tech:xsd:camt.053.001.08'
+const XSI_NS = 'http://www.w3.org/2001/XMLSchema-instance'
+const STMT_ORDER = ['Id','ElctrncSeqNb','CreDtTm','FrToDt','CpyDplctInd','Acct']
+const STMT_MULTI = ['Bal','Ntry']
+const NTRY_ORDER = ['NtryRef','Amt','CdtDbtInd','RvslInd','Sts','BookgDt','ValDt','AcctSvcrRef','BkTxCd','NtryDtls','AddtlNtryInf']
+const TX_ORDER   = ['Refs','Amt','CdtDbtInd','AmtDtls','BkTxCd','RltdPties','RltdAgts','RmtInf']
+
+function ensureArray(v) {
+  if (Array.isArray(v)) return v
+  if (v !== undefined && v !== null) return [v]
+  return []
+}
+
+function reorderObject(obj, order, multi = []) {
+  const out = {}
+  order.forEach(key => { if (obj[key] !== undefined) out[key] = obj[key] })
+  multi.forEach(key => { if (obj[key] !== undefined) out[key] = obj[key] })
+  Object.keys(obj)
+    .filter(k => !order.includes(k) && !multi.includes(k))
+    .forEach(k => { out[k] = obj[k] })
+  return out
 }
 
 export default async function handler(req, res) {
@@ -14,27 +40,99 @@ export default async function handler(req, res) {
       form.parse(req, (err, fields, files) => err ? reject(err) : resolve({ fields, files }))
     })
 
-    // Stelle sicher, dass wir die Datei wirklich bekommen
-    if (!files.file) {
+    const file = files.file
+    if (!file) {
       res.status(400).send('No file uploaded')
       return
     }
 
-    // Pfad (je nach neuer/formidable-Version)
-    const filePath = files.file.filepath || files.file.path
-    if (!fs.existsSync(filePath)) {
-      res.status(400).send(`File not found: ${filePath}`)
+    const path = file.filepath || file.path
+    if (!fs.existsSync(path)) {
+      res.status(400).send(`File not found: ${path}`)
       return
     }
 
-    // Lese den rohen XML-Content
-    const xml = fs.readFileSync(filePath, 'utf8')
+    const xml = fs.readFileSync(path, 'utf8')
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
+    const docJson = parser.parse(xml)
 
-    // Sende ihn 1:1 zurück (zum Testen)
+    // Fallback für Gruppen-Infotext
+    const grpText = ((docJson.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf) ?? '') || ''
+
+    // Statement lesen und neu sortieren
+    const stmtIn = docJson.Document.BkToCstmrStmt.Stmt
+    const newStmt = reorderObject(stmtIn, STMT_ORDER, STMT_MULTI)
+
+    // Buchungen transformieren
+    const oldEntries = ensureArray(stmtIn.Ntry)
+    newStmt.Ntry = oldEntries.map(oldN => {
+      const n = {}
+
+      // Ntry-Felder in Reihenfolge
+      NTRY_ORDER.forEach(tag => {
+        if (tag === 'NtryDtls') {
+          if (oldN.NtryDtls) n.NtryDtls = oldN.NtryDtls
+        } else if (tag === 'AddtlNtryInf') {
+          n.AddtlNtryInf = oldN.AddtlNtryInf ?? grpText
+        } else if (oldN[tag] !== undefined) {
+          n[tag] = oldN[tag]
+        }
+      })
+
+      // TxDtls transformieren
+      if (n.NtryDtls?.TxDtls) {
+        const txIn = n.NtryDtls.TxDtls
+        const newTx = reorderObject(txIn, TX_ORDER)
+
+        // Fallbacks für fehlende Unterelemente
+        if (!newTx.AmtDtls && txIn.Amt) {
+          newTx.AmtDtls = {
+            InstdAmt: { '#text': txIn.Amt['#text'], 'Ccy': txIn.Amt.Ccy }
+          }
+        }
+        if (!newTx.RmtInf) {
+          newTx.RmtInf = { Ustrd: n.AddtlNtryInf }
+        }
+        if (!newTx.RltdPties && oldN.RltdPties) {
+          newTx.RltdPties = oldN.RltdPties
+        }
+        if (!newTx.RltdAgts && oldN.RltdAgts) {
+          newTx.RltdAgts = oldN.RltdAgts
+        }
+        if (!newTx.BkTxCd && oldN.BkTxCd) {
+          newTx.BkTxCd = oldN.BkTxCd
+        }
+
+        n.NtryDtls.TxDtls = newTx
+      }
+
+      return n
+    })
+
+    // Ergebnis-JSON für XML-Builder
+    const outJson = {
+      Document: {
+        '@xmlns': NEW_NS,
+        '@xmlns:xsi': XSI_NS,
+        '@xsi:schemaLocation': `${NEW_NS} camt.053.001.08.xsd`,
+        BkToCstmrStmt: {
+          GrpHdr: docJson.Document.BkToCstmrStmt.GrpHdr,
+          Stmt: newStmt
+        }
+      }
+    }
+
+    const builder = new XMLBuilder({
+      ignoreAttributes: false,
+      attributeNamePrefix: ''
+    })
+    const outXml = builder.build(outJson)
+
     res.setHeader('Content-Type', 'application/xml')
-    res.status(200).send(xml)
+    res.status(200).send(outXml)
+
   } catch (err) {
-    console.error('🔥 Error in /api/convert:', err)
-    res.status(500).send(`Server error: ${err.message}`)
+    console.error('Error in /api/convert:', err)
+    res.status(500).send('Server error')
   }
 }
