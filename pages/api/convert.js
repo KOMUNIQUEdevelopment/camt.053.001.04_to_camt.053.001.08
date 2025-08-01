@@ -24,7 +24,7 @@ function ensureArray(v) {
 function reorderObject(obj, order, multi = []) {
   const out = {}
   order.forEach(k => { if (obj[k] !== undefined) out[k] = obj[k] })
-  multi.forEach(k =>  { if (obj[k] !== undefined) out[k] = obj[k] })
+  multi.forEach(k => { if (obj[k] !== undefined) out[k] = obj[k] })
   Object.keys(obj)
     .filter(k => !order.includes(k) && !multi.includes(k))
     .forEach(k => { out[k] = obj[k] })
@@ -33,7 +33,7 @@ function reorderObject(obj, order, multi = []) {
 
 export default async function handler(req, res) {
   try {
-    // Datei aus dem Formular lesen
+    // 1) Datei aus Formular laden
     const form = new formidable.IncomingForm()
     const { files } = await new Promise((resolve, reject) => {
       form.parse(req, (err, fields, files) =>
@@ -45,23 +45,23 @@ export default async function handler(req, res) {
     const path = file.filepath || file.path
     if (!fs.existsSync(path)) return res.status(400).send(`File not found: ${path}`)
 
-    // XML lesen & parsen
+    // 2) XML lesen & parsen
     const xml = fs.readFileSync(path, 'utf8')
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' })
     const docJson = parser.parse(xml)
 
-    // Fallback-Text
+    // 3) Fallback-Text
     const grpText = docJson.Document?.BkToCstmrStmt?.GrpHdr?.AddtlInf || ''
 
-    // Stmt neu sortieren
+    // 4) <Stmt> neu sortieren
     const stmtIn  = docJson.Document.BkToCstmrStmt.Stmt
     const newStmt = reorderObject(stmtIn, STMT_ORDER, STMT_MULTI)
 
-    // Jede Ntry transformieren
+    // 5) Buchungen transformieren
     const oldEntries = ensureArray(stmtIn.Ntry)
     newStmt.Ntry = oldEntries.map(oldN => {
       const n = {}
-      // Ntry-Felder
+      // 5a) Ntry-Felder
       NTRY_ORDER.forEach(tag => {
         if (tag === 'NtryDtls') {
           if (oldN.NtryDtls) n.NtryDtls = oldN.NtryDtls
@@ -71,7 +71,7 @@ export default async function handler(req, res) {
           n[tag] = oldN[tag]
         }
       })
-      // TxDtls & Fallbacks
+      // 5b) TxDtls & Fallbacks
       if (n.NtryDtls?.TxDtls) {
         const txIn  = n.NtryDtls.TxDtls
         const newTx = reorderObject(txIn, TX_ORDER)
@@ -89,7 +89,7 @@ export default async function handler(req, res) {
       return n
     })
 
-    // JSON für Builder
+    // 6) Ergebnis-JSON
     const outJson = {
       Document: {
         xmlns:              NEW_NS,
@@ -102,7 +102,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // XML erstellen ohne automatische Deklaration
+    // 7) XML-Body pretty-printen
     const builder = new XMLBuilder({
       ignoreAttributes:    false,
       attributeNamePrefix: '',
@@ -112,10 +112,10 @@ export default async function handler(req, res) {
     })
     const xmlBody = builder.build(outJson)
 
-    // Manuell XML-Deklaration wie Python
+    // 8) Manuell Deklaration und Leerzeile wie Python
     const declaration = "<?xml version='1.0' encoding='UTF-8'?>\n\n"
 
-    // Response
+    // 9) Antwort
     res.setHeader('Content-Type', 'application/xml')
     res.status(200).send(declaration + xmlBody + '\n')
 
